@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -773,6 +774,168 @@ func TestMaxBodySizeMiddleware(t *testing.T) {
 			handler.ServeHTTP(w, req)
 
 			require.Equal(t, tt.expectedStatus, w.Code)
+		})
+	}
+}
+
+func TestSearch_LimitValidation(t *testing.T) {
+	tests := []struct {
+		name           string
+		query          string
+		expectList     bool
+		expectedStatus int
+		expectedDetail string
+	}{
+		{name: "absent limit is legacy mode", query: "after=1672531200", expectList: true, expectedStatus: http.StatusOK},
+		{name: "limit lower bound", query: "after=1672531200&limit=1", expectList: true, expectedStatus: http.StatusOK},
+		{name: "limit upper bound", query: "after=1672531200&limit=1000", expectList: true, expectedStatus: http.StatusOK},
+		{name: "limit zero", query: "after=1672531200&limit=0", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' must be an integer between 1 and 1000"},
+		{name: "limit negative", query: "after=1672531200&limit=-3", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' must be an integer between 1 and 1000"},
+		{name: "limit above maximum is rejected, not clamped", query: "after=1672531200&limit=1001", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' must be an integer between 1 and 1000"},
+		{name: "limit not an integer", query: "after=1672531200&limit=ten", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' must be an integer between 1 and 1000"},
+		{name: "limit present but empty", query: "after=1672531200&limit=", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' must be an integer between 1 and 1000"},
+		{name: "after is validated before limit", query: "limit=5", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'after' must not be empty"},
+		// `after` is a watermark, not a duration: 0 (the epoch, "everything") is a
+		// legitimate value, so the message must not promise a *positive* integer.
+		{name: "after zero is accepted", query: "after=0", expectList: true, expectedStatus: http.StatusOK},
+		{name: "after not an integer", query: "after=abc", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'after' must be a non-negative integer (unixtime)"},
+		{name: "after negative", query: "after=-1", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'after' must be a non-negative integer (unixtime)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			s3Mock := mockS3.NewMockS3Contract(ctrl)
+			if tt.expectList {
+				s3Mock.EXPECT().ListObjectsV2(gomock.Any(), gomock.Any(), gomock.Any()).Return(&s3.ListObjectsV2Output{}, nil)
+			}
+			svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
+			require.NoError(t, err)
+			server := New(Config{Prefix: "/api"}, svc, health.NewService(mockChecker{name: "storage", status: health.StatusUp}))
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/bom?"+tt.query, nil)
+			w := httptest.NewRecorder()
+			server.Handler().ServeHTTP(w, req)
+
+			require.Equal(t, tt.expectedStatus, w.Code)
+			if tt.expectedStatus == http.StatusOK {
+				require.JSONEq(t, "[]", w.Body.String())
+				return
+			}
+			require.Equal(t, "application/problem+json", w.Header().Get("Content-Type"))
+			var p pd.Problem
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &p))
+			require.Contains(t, p.Detail, tt.expectedDetail)
+		})
+	}
+}
+
+// The limit reaches the service: three objects in three seconds, limit=2 → two entries,
+// oldest first.
+func TestSearch_LimitIsApplied(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	base := time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)
+
+	s3Mock := mockS3.NewMockS3Contract(ctrl)
+	s3Mock.EXPECT().ListObjectsV2(gomock.Any(), gomock.Any(), gomock.Any()).Return(&s3.ListObjectsV2Output{
+		Contents: []types.Object{
+			{Key: aws.String("urn:uuid:c-1"), LastModified: aws.Time(base.Add(3 * time.Second))},
+			{Key: aws.String("urn:uuid:a-1"), LastModified: aws.Time(base.Add(1 * time.Second))},
+			{Key: aws.String("urn:uuid:b-1"), LastModified: aws.Time(base.Add(2 * time.Second))},
+		},
+	}, nil)
+	s3Mock.EXPECT().HeadObject(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, in *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+			when := map[string]time.Time{"urn:uuid:a-1": base.Add(1 * time.Second), "urn:uuid:b-1": base.Add(2 * time.Second)}[aws.ToString(in.Key)]
+			return &s3.HeadObjectOutput{
+				ContentLength: aws.Int64(1), ContentType: aws.String("application/json"), LastModified: aws.Time(when),
+				Metadata: map[string]string{store.MetaCryptoStatsKey: "{}"},
+			}, nil
+		}).Times(2)
+
+	svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
+	require.NoError(t, err)
+	server := New(Config{Prefix: "/api"}, svc, health.NewService(mockChecker{name: "storage", status: health.StatusUp}))
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/bom?after=%d&limit=2", base.Unix()), nil)
+	w := httptest.NewRecorder()
+	server.Handler().ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var response []service.SearchRes
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&response))
+	require.Len(t, response, 2)
+	require.Equal(t, "urn:uuid:a", response[0].SerialNumber)
+	require.Equal(t, "urn:uuid:b", response[1].SerialNumber)
+}
+
+// GET /v1/bom/{urn} rejects a `version` query parameter that cannot name a stored
+// object: only a positive integer without leading zeros, or "original", ever became an
+// object key (see service.ValidVersion). Without the check the value went straight into
+// the S3 key and came back as a 404 — indistinguishable from a BOM that once existed and
+// was deleted.
+//
+// An absent value still means "latest version", and so does an empty or all-whitespace
+// one: GetBOMByUrn has always treated `strings.TrimSpace(version) == ""` as "latest", so
+// rejecting `?version=` would take that away from a caller it has been serving all along.
+func TestGetByURN_VersionValidation(t *testing.T) {
+	validURN := "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79"
+	tests := []struct {
+		name           string
+		query          string
+		expectGet      bool
+		expectLatest   bool
+		expectedStatus int
+	}{
+		{name: "zero is not a version", query: "?version=0", expectedStatus: http.StatusBadRequest},
+		{name: "not a number", query: "?version=foo", expectedStatus: http.StatusBadRequest},
+		{name: "leading zero", query: "?version=01", expectedStatus: http.StatusBadRequest},
+		{name: "negative", query: "?version=-2", expectedStatus: http.StatusBadRequest},
+		{name: "present but empty means latest", query: "?version=", expectLatest: true, expectedStatus: http.StatusOK},
+		{name: "whitespace means latest", query: "?version=%20", expectLatest: true, expectedStatus: http.StatusOK},
+		{name: "numbered version", query: "?version=3", expectGet: true, expectedStatus: http.StatusOK},
+		{name: "the original copy", query: "?version=original", expectGet: true, expectedStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			s3Mock := mockS3.NewMockS3Contract(ctrl)
+			if tt.expectLatest {
+				// The latest-version path: list the URN's versions, then fetch the
+				// highest numbered one.
+				s3Mock.EXPECT().ListObjectsV2(gomock.Any(), gomock.Any(), gomock.Any()).Return(&s3.ListObjectsV2Output{
+					Contents: []types.Object{
+						{Key: aws.String(validURN + "-1")},
+						{Key: aws.String(validURN + "-2")},
+					},
+				}, nil)
+			}
+			if tt.expectGet || tt.expectLatest {
+				s3Mock.EXPECT().GetObject(gomock.Any(), gomock.Any()).Return(&s3.GetObjectOutput{
+					Body: io.NopCloser(strings.NewReader(`{"bomFormat":"CycloneDX"}`)),
+				}, nil)
+			}
+			svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
+			require.NoError(t, err)
+			server := New(Config{Prefix: "/api"}, svc, health.NewService(mockChecker{name: "storage", status: health.StatusUp}))
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/bom/"+validURN+tt.query, nil)
+			w := httptest.NewRecorder()
+			server.Handler().ServeHTTP(w, req)
+
+			require.Equal(t, tt.expectedStatus, w.Code)
+			if tt.expectedStatus == http.StatusOK {
+				return
+			}
+			require.Equal(t, "application/problem+json", w.Header().Get("Content-Type"))
+			var p pd.Problem
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &p))
+			require.Equal(t, "Request validation failed, query parameter 'version' must be a positive integer or 'original'.", p.Detail)
 		})
 	}
 }

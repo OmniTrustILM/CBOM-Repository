@@ -124,6 +124,23 @@ func TestStore_GetHeadObject(t *testing.T) {
 			},
 			wantErr: nil,
 		},
+		{
+			name: "success - nil optional fields tolerated",
+			key:  "nil-optional-fields-key",
+			setupMock: func(m *mockS3.MockS3Contract) {
+				m.EXPECT().
+					HeadObject(gomock.Any(), gomock.Any()).
+					Return(&s3.HeadObjectOutput{
+						ContentLength: nil,
+						ContentType:   nil,
+						LastModified:  nil,
+						Metadata:      map[string]string{},
+					}, nil)
+			},
+			// Nil optional fields must not panic; they decode to their zero values.
+			wantHead: store.HeadObject{Metadata: map[string]string{}},
+			wantErr:  nil,
+		},
 	}
 
 	for _, tt := range tests {

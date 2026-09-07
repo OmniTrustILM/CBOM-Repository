@@ -39,7 +39,9 @@ type BOMCreated struct {
 //     already exists.
 //
 // Cryptographic asset statistics are calculated for all uploaded BOMs and stored
-// as metadata alongside the BOM document.
+// as metadata alongside the BOM document, together with the counting-algorithm
+// version (CryptoStatsVersion) and, when the component walk stopped at its depth
+// bound, the truncation marker that tells consumers the counts are a lower bound.
 //
 // Parameters:
 //   - ctx: Context for cancellation, deadlines and additional slog fields.
@@ -116,24 +118,25 @@ func (s Service) UploadBOM(ctx context.Context, rc io.ReadCloser, declaredVersio
 		return BOMCreated{}, fmt.Errorf("%w: does not conform to CycloneDX %s schema", ErrValidation, effectiveVersion)
 	}
 
-	cryptoStats := CalculateCryptoStats(ctx, &bom)
+	cryptoStats, truncated := countCryptoStats(ctx, &bom)
 	b, err := json.Marshal(cryptoStats)
 	if err != nil {
 		return BOMCreated{}, fmt.Errorf("`json.Marshal()` failed: %w", err)
 	}
+	stats := cryptoStatsMeta{statsJSON: string(b), truncated: truncated}
 
 	var retVal BOMCreated
 	var retErr error
 	switch {
 	case bom.SerialNumber == "":
-		retVal, retErr = s.uploadCaseSNInvalid(ctx, bom, buf, string(b))
+		retVal, retErr = s.uploadCaseSNInvalid(ctx, bom, buf, stats)
 
 	case bom.Version < 1:
-		retVal, retErr = s.uploadCaseSNValidVersionInvalid(ctx, bom, string(b))
+		retVal, retErr = s.uploadCaseSNValidVersionInvalid(ctx, bom, stats)
 
 	default:
 		// serial number of the BOM is valid, version is set
-		retVal, retErr = s.uploadCaseSNValidVersionValid(ctx, bom, buf, string(b))
+		retVal, retErr = s.uploadCaseSNValidVersionValid(ctx, bom, buf, stats)
 	}
 	if retErr == nil {
 		retVal.CryptoStats = cryptoStats
@@ -141,7 +144,16 @@ func (s Service) UploadBOM(ctx context.Context, rc io.ReadCloser, declaredVersio
 	return retVal, retErr
 }
 
-func (s Service) uploadCaseSNInvalid(ctx context.Context, bom cdx.BOM, orig bytes.Buffer, cryptoStats string) (BOMCreated, error) {
+// cryptoStatsMeta is what one upload knows about its own statistics: their JSON
+// encoding and whether the component walk was cut short by maxComponentDepth. Every
+// object an upload stores — the `original` copy and the normalised version alike —
+// carries the same pair, so the two never disagree about the same document.
+type cryptoStatsMeta struct {
+	statsJSON string
+	truncated bool
+}
+
+func (s Service) uploadCaseSNInvalid(ctx context.Context, bom cdx.BOM, orig bytes.Buffer, stats cryptoStatsMeta) (BOMCreated, error) {
 	slog.DebugContext(ctx, "BOM does not have serial number specified - generating a new one.")
 	// serial number is missing, so we're going to generate a unique new one,
 	// that means this will be version 1, even if something else was set
@@ -163,8 +175,10 @@ func (s Service) uploadCaseSNInvalid(ctx context.Context, bom cdx.BOM, orig byte
 
 	// store the original unchanged BOM
 	metaOriginal := store.Metadata{
-		Version:     "original",
-		CryptoStats: cryptoStats,
+		Version:              "original",
+		CryptoStats:          stats.statsJSON,
+		CryptoStatsVersion:   CryptoStatsVersion,
+		CryptoStatsTruncated: stats.truncated,
 	}
 	if err := s.store.Upload(ctx, uploadKeyOriginal(bom.SerialNumber), metaOriginal, orig.Bytes()); err != nil {
 		return BOMCreated{}, err
@@ -173,8 +187,10 @@ func (s Service) uploadCaseSNInvalid(ctx context.Context, bom cdx.BOM, orig byte
 
 	// store the modified BOM with serialNumber and version set
 	meta := store.Metadata{
-		Version:     fmt.Sprintf("%d", bom.Version),
-		CryptoStats: cryptoStats,
+		Version:              fmt.Sprintf("%d", bom.Version),
+		CryptoStats:          stats.statsJSON,
+		CryptoStatsVersion:   CryptoStatsVersion,
+		CryptoStatsTruncated: stats.truncated,
 	}
 
 	var modifiedBuf bytes.Buffer
@@ -195,7 +211,7 @@ func (s Service) uploadCaseSNInvalid(ctx context.Context, bom cdx.BOM, orig byte
 	}, nil
 }
 
-func (s Service) uploadCaseSNValidVersionInvalid(ctx context.Context, bom cdx.BOM, cryptoStats string) (BOMCreated, error) {
+func (s Service) uploadCaseSNValidVersionInvalid(ctx context.Context, bom cdx.BOM, stats cryptoStatsMeta) (BOMCreated, error) {
 	slog.DebugContext(ctx, "BOM has only serial number specified - fetching the latest version")
 	versions, hasOriginal, err := s.store.GetObjectVersions(ctx, bom.SerialNumber)
 	switch {
@@ -214,8 +230,10 @@ func (s Service) uploadCaseSNValidVersionInvalid(ctx context.Context, bom cdx.BO
 	}
 
 	meta := store.Metadata{
-		Version:     fmt.Sprintf("%d", bom.Version),
-		CryptoStats: cryptoStats,
+		Version:              fmt.Sprintf("%d", bom.Version),
+		CryptoStats:          stats.statsJSON,
+		CryptoStatsVersion:   CryptoStatsVersion,
+		CryptoStatsTruncated: stats.truncated,
 	}
 
 	var modifiedBuf bytes.Buffer
@@ -234,7 +252,7 @@ func (s Service) uploadCaseSNValidVersionInvalid(ctx context.Context, bom cdx.BO
 	}, nil
 }
 
-func (s Service) uploadCaseSNValidVersionValid(ctx context.Context, bom cdx.BOM, orig bytes.Buffer, cryptoStats string) (BOMCreated, error) {
+func (s Service) uploadCaseSNValidVersionValid(ctx context.Context, bom cdx.BOM, orig bytes.Buffer, stats cryptoStatsMeta) (BOMCreated, error) {
 	slog.DebugContext(ctx, "BOM has serial number and version specified.")
 	// let's make sure it doesn't exist already
 	exists, err := s.store.KeyExists(ctx, uploadKey(bom.SerialNumber, bom.Version))
@@ -249,8 +267,10 @@ func (s Service) uploadCaseSNValidVersionValid(ctx context.Context, bom cdx.BOM,
 	}
 
 	meta := store.Metadata{
-		Version:     fmt.Sprintf("%d", bom.Version),
-		CryptoStats: cryptoStats,
+		Version:              fmt.Sprintf("%d", bom.Version),
+		CryptoStats:          stats.statsJSON,
+		CryptoStatsVersion:   CryptoStatsVersion,
+		CryptoStatsTruncated: stats.truncated,
 	}
 
 	if err := s.store.Upload(ctx, uploadKey(bom.SerialNumber, bom.Version), meta, orig.Bytes()); err != nil {

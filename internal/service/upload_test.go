@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -715,4 +716,108 @@ func TestUploadBOM_Rejects17InvalidAlgorithmFamily(t *testing.T) {
 	bogus := `{"bomFormat":"CycloneDX","specVersion":"1.7","components":[{"type":"cryptographic-asset","name":"x","cryptoProperties":{"assetType":"algorithm","algorithmProperties":{"primitive":"key-agree","algorithmFamily":"BOGUS-NOT-A-REAL-FAMILY-999"}}}]}`
 	_, err = svc.UploadBOM(context.Background(), io.NopCloser(strings.NewReader(bogus)), "1.7")
 	require.ErrorIs(t, err, ErrValidation)
+}
+
+// Every stored object — the normalised version and the `original` copy alike — carries
+// the counting-algorithm version next to its statistics, so consumers can tell a
+// nested (v2) count from a legacy shallow one.
+func TestUploadBOM_WritesCryptoStatsVersionMetadata(t *testing.T) {
+	serial := "urn:uuid:550e8400-e29b-11d4-a716-446655440000"
+	cases := map[string]struct {
+		body        string
+		listVersion bool
+		uploads     int
+	}{
+		"missing serial stores original and version 1": {body: minimalBOMJSON(t, false, "", 0, false), uploads: 2},
+		"serial only gets the next version":            {body: minimalBOMJSONVersion(t, "1.6", true, serial, 0), listVersion: true, uploads: 1},
+		"serial and version stored as-is":              {body: minimalBOMJSONVersion(t, "1.6", true, serial, 3), uploads: 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			s3Mock := mockS3.NewMockS3Contract(ctrl)
+			s3Manager := mockS3.NewMockS3Manager(ctrl)
+			svc, err := New(store.New(store.Config{Bucket: "bucket"}, s3Mock, s3Manager), Config{})
+			require.NoError(t, err)
+
+			s3Mock.EXPECT().HeadObject(gomock.Any(), gomock.Any()).Return((*s3.HeadObjectOutput)(nil), &types.NotFound{}).AnyTimes()
+			if tc.listVersion {
+				s3Mock.EXPECT().ListObjectsV2(gomock.Any(), gomock.Any(), gomock.Any()).Return(&s3.ListObjectsV2Output{Contents: []types.Object{}}, nil)
+			}
+			s3Manager.EXPECT().UploadObject(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, in *manager.UploadObjectInput, _ ...func(*manager.Options)) (*manager.UploadObjectOutput, error) {
+					require.Equal(t, CryptoStatsVersion, in.Metadata[store.MetaCryptoStatsVersionKey], "key %s", *in.Key)
+					require.NotEmpty(t, in.Metadata[store.MetaCryptoStatsKey])
+					require.NotEmpty(t, in.Metadata[store.MetaVersionKey])
+					return &manager.UploadObjectOutput{}, nil
+				}).Times(tc.uploads)
+
+			_, err = svc.UploadBOM(context.Background(), io.NopCloser(strings.NewReader(tc.body)), "1.6")
+			require.NoError(t, err)
+		})
+	}
+}
+
+// deeplyNestedBOMJSON returns a valid CycloneDX 1.6 document whose `components` nest
+// `depth` levels deep, every level a crypto asset.
+func deeplyNestedBOMJSON(t *testing.T, depth int) string {
+	t.Helper()
+	node := map[string]any{
+		"type": "cryptographic-asset", "name": fmt.Sprintf("level-%d", depth),
+		"cryptoProperties": map[string]any{"assetType": "algorithm"},
+	}
+	for level := depth - 1; level >= 1; level-- {
+		node = map[string]any{
+			"type": "cryptographic-asset", "name": fmt.Sprintf("level-%d", level),
+			"cryptoProperties": map[string]any{"assetType": "algorithm"},
+			"components":       []any{node},
+		}
+	}
+	b, err := json.Marshal(map[string]any{
+		"bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1,
+		"components": []any{node},
+	})
+	require.NoError(t, err)
+	return string(b)
+}
+
+// A document nested past the walk's depth bound is stored with the truncation marker, so
+// paged search can tell consumers its statistics are a lower bound. A document within
+// the bound carries no marker at all — the key's absence is the "counts are complete"
+// signal, and adding it with value "false" to every object would be noise.
+func TestUploadBOM_MarksTruncatedCryptoStats(t *testing.T) {
+	cases := map[string]struct {
+		body          string
+		wantTruncated bool
+	}{
+		"nested past the depth bound": {body: deeplyNestedBOMJSON(t, maxComponentDepth+5), wantTruncated: true},
+		"an ordinary document":        {body: deeplyNestedBOMJSON(t, 3)},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			s3Mock := mockS3.NewMockS3Contract(ctrl)
+			s3Manager := mockS3.NewMockS3Manager(ctrl)
+			svc, err := New(store.New(store.Config{Bucket: "bucket"}, s3Mock, s3Manager), Config{})
+			require.NoError(t, err)
+
+			s3Mock.EXPECT().HeadObject(gomock.Any(), gomock.Any()).Return((*s3.HeadObjectOutput)(nil), &types.NotFound{}).AnyTimes()
+			// No serial number in the document: the original copy and the normalised
+			// version 1 are both stored, and both must agree on the marker.
+			s3Manager.EXPECT().UploadObject(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, in *manager.UploadObjectInput, _ ...func(*manager.Options)) (*manager.UploadObjectOutput, error) {
+					value, present := in.Metadata[store.MetaCryptoStatsTruncatedKey]
+					require.Equal(t, tc.wantTruncated, present, "key %s", *in.Key)
+					if tc.wantTruncated {
+						require.Equal(t, "true", value, "key %s", *in.Key)
+					}
+					return &manager.UploadObjectOutput{}, nil
+				}).Times(2)
+
+			_, err = svc.UploadBOM(context.Background(), io.NopCloser(strings.NewReader(tc.body)), "1.6")
+			require.NoError(t, err)
+		})
+	}
 }

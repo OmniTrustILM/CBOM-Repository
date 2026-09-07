@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -188,4 +189,95 @@ func TestCalculateCryptoStats_1_7_ParityWithBuckets(t *testing.T) {
 	require.Equal(t, 1, stats.CryptoAsset.Cert.Total)
 	require.Equal(t, 1, stats.CryptoAsset.Protocol.Total)
 	require.Equal(t, 1, stats.CryptoAsset.Related.Total)
+}
+
+// Nested `components` must be counted: a crypto asset two or three levels below a
+// library, or below another crypto asset, is still an asset of the document. The
+// shallow walk counted only the top-level array (1 asset here); the tree holds 5.
+func TestCalculateCryptoStats_CountsNestedComponents(t *testing.T) {
+	input := `{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "components": [
+    {
+      "type": "library", "name": "openssl",
+      "components": [
+        { "type": "cryptographic-asset", "name": "AES-128-GCM", "cryptoProperties": { "assetType": "algorithm" } },
+        {
+          "type": "cryptographic-asset", "name": "leaf-cert", "cryptoProperties": { "assetType": "certificate" },
+          "components": [
+            { "type": "cryptographic-asset", "name": "tls", "cryptoProperties": { "assetType": "protocol", "protocolProperties": { "type": "tls" } } }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset", "name": "rsa-key", "cryptoProperties": { "assetType": "related-crypto-material" },
+      "components": [
+        {
+          "type": "library", "name": "nested-lib",
+          "components": [
+            { "type": "cryptographic-asset", "name": "RSA-2048", "cryptoProperties": { "assetType": "algorithm" } },
+            { "type": "cryptographic-asset", "name": "no-props" }
+          ]
+        }
+      ]
+    },
+    { "type": "framework", "name": "empty-children", "components": [] }
+  ]
+}`
+	var bom cdx.BOM
+	require.NoError(t, cdx.NewBOMDecoder(strings.NewReader(input), cdx.BOMFileFormatJSON).Decode(&bom))
+
+	stats := service.CalculateCryptoStats(context.Background(), &bom)
+	require.Equal(t, 5, stats.CryptoAsset.Total)
+	require.Equal(t, 2, stats.CryptoAsset.Algo.Total)
+	require.Equal(t, 1, stats.CryptoAsset.Cert.Total)
+	require.Equal(t, 1, stats.CryptoAsset.Protocol.Total)
+	require.Equal(t, 1, stats.CryptoAsset.Related.Total)
+}
+
+// The walk is bounded at 1000 levels (Core's DocumentScope.MAX_DEPTH). A chain nested
+// 1005 deep must count exactly the first 1000 levels and terminate promptly instead of
+// recursing without bound.
+func TestCalculateCryptoStats_DepthBound(t *testing.T) {
+	const chain = 1005
+	current := cdx.Component{
+		Type: cdx.ComponentTypeCryptographicAsset, Name: "level-1005",
+		CryptoProperties: &cdx.CryptoProperties{AssetType: cdx.CryptoAssetTypeAlgorithm},
+	}
+	for level := chain - 1; level >= 1; level-- {
+		child := current
+		current = cdx.Component{
+			Type: cdx.ComponentTypeCryptographicAsset, Name: fmt.Sprintf("level-%d", level),
+			CryptoProperties: &cdx.CryptoProperties{AssetType: cdx.CryptoAssetTypeAlgorithm},
+			Components:       &[]cdx.Component{child},
+		}
+	}
+	bom := cdx.BOM{Components: &[]cdx.Component{current}}
+
+	stats := service.CalculateCryptoStats(context.Background(), &bom)
+	require.Equal(t, 1000, stats.CryptoAsset.Total)
+	require.Equal(t, 1000, stats.CryptoAsset.Algo.Total)
+}
+
+// Document order is preserved depth-first (parent, its subtree, next sibling) — the
+// same order Core's walker uses, so per-type counts line up with Core's extraction.
+func TestCalculateCryptoStats_SiblingsAfterSubtree(t *testing.T) {
+	input := `{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "components": [
+    { "type": "cryptographic-asset", "name": "a", "cryptoProperties": { "assetType": "algorithm" },
+      "components": [ { "type": "cryptographic-asset", "name": "a.1", "cryptoProperties": { "assetType": "certificate" } } ] },
+    { "type": "cryptographic-asset", "name": "b", "cryptoProperties": { "assetType": "protocol", "protocolProperties": { "type": "ssh" } } }
+  ]
+}`
+	var bom cdx.BOM
+	require.NoError(t, cdx.NewBOMDecoder(strings.NewReader(input), cdx.BOMFileFormatJSON).Decode(&bom))
+	stats := service.CalculateCryptoStats(context.Background(), &bom)
+	require.Equal(t, 3, stats.CryptoAsset.Total)
+	require.Equal(t, 1, stats.CryptoAsset.Algo.Total)
+	require.Equal(t, 1, stats.CryptoAsset.Cert.Total)
+	require.Equal(t, 1, stats.CryptoAsset.Protocol.Total)
 }

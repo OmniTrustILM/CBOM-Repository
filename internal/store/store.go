@@ -26,6 +26,14 @@ var (
 const (
 	MetaVersionKey     = "version"
 	MetaCryptoStatsKey = "crypto-stats"
+	// MetaCryptoStatsVersionKey names the counting algorithm that produced the value
+	// under MetaCryptoStatsKey (see service.CryptoStatsVersion). Objects uploaded
+	// before the key existed carry no value and hold the legacy shallow count.
+	MetaCryptoStatsVersionKey = "crypto-stats-version"
+	// MetaCryptoStatsTruncatedKey is set to "true" when the component walk that
+	// produced MetaCryptoStatsKey stopped at its depth bound, so the counts are a
+	// lower bound rather than the whole document. The key is absent otherwise.
+	MetaCryptoStatsTruncatedKey = "crypto-stats-truncated"
 )
 
 type S3Contract interface {
@@ -58,13 +66,25 @@ type Store struct {
 type Metadata struct {
 	Version     string
 	CryptoStats string
+	// CryptoStatsVersion is written under MetaCryptoStatsVersionKey when non-empty.
+	CryptoStatsVersion string
+	// CryptoStatsTruncated is written under MetaCryptoStatsTruncatedKey, as "true",
+	// only when set; a complete count leaves the key out entirely.
+	CryptoStatsTruncated bool
 }
 
 func (m Metadata) Map() map[string]string {
-	return map[string]string{
+	res := map[string]string{
 		MetaVersionKey:     m.Version,
 		MetaCryptoStatsKey: m.CryptoStats,
 	}
+	if m.CryptoStatsVersion != "" {
+		res[MetaCryptoStatsVersionKey] = m.CryptoStatsVersion
+	}
+	if m.CryptoStatsTruncated {
+		res[MetaCryptoStatsTruncatedKey] = "true"
+	}
+	return res
 }
 
 func New(cfg Config, s3Client S3Contract, s3Manager S3Manager) Store {
@@ -77,19 +97,27 @@ func New(cfg Config, s3Client S3Contract, s3Manager S3Manager) Store {
 	return s
 }
 
-// Search returns a list of all object keys in the S3 bucket that were modified
-// after the specified Unix timestamp. The search iterates through all objects
-// in the bucket using pagination and filters them based on their LastModified
-// time.
+// ObjectInfo is one listed object: its key and the LastModified timestamp the store
+// reported for it. LastModified precision is the store's (seconds on AWS S3,
+// milliseconds on MinIO).
+type ObjectInfo struct {
+	Key          string
+	LastModified time.Time
+}
+
+// Search returns every object in the S3 bucket whose LastModified is strictly after the
+// specified Unix timestamp. The search iterates through all objects in the bucket using
+// pagination and filters them by LastModified; objects are returned in listing order
+// (UTF-8 key order).
 //
 // Parameters:
 //   - ctx: Context for cancellation, deadlines and additional slog fields.
 //   - ts: Unix timestamp (seconds since epoch) used as the lower bound for filtering
 //
-// Returns a slice of object keys (strings) and an error if the operation fails.
-// An empty slice is returned if no objects match the criteria or if the bucket
-// is empty.
-func (s Store) Search(ctx context.Context, ts int64) ([]string, error) {
+// Returns a slice of ObjectInfo and an error if the operation fails. An empty slice is
+// returned if no objects match the criteria or if the bucket is empty. Listed entries
+// without a key or LastModified are logged and skipped.
+func (s Store) Search(ctx context.Context, ts int64) ([]ObjectInfo, error) {
 	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(s.cfg.Bucket),
 	}
@@ -98,7 +126,7 @@ func (s Store) Search(ctx context.Context, ts int64) ([]string, error) {
 
 	var err error
 	var output *s3.ListObjectsV2Output
-	res := []string{}
+	res := []ObjectInfo{}
 
 	objectPaginator := s3.NewListObjectsV2Paginator(s.s3Client, input)
 	for objectPaginator.HasMorePages() {
@@ -107,8 +135,12 @@ func (s Store) Search(ctx context.Context, ts int64) ([]string, error) {
 			return nil, errors.New("obtaining next page failed")
 		}
 		for _, cpy := range output.Contents {
+			if cpy.Key == nil || cpy.LastModified == nil {
+				slog.WarnContext(ctx, "Listed object lacks a key or LastModified. Skipping.", slog.String("key", aws.ToString(cpy.Key)))
+				continue
+			}
 			if unixTimestamp.Before(*cpy.LastModified) {
-				res = append(res, *cpy.Key)
+				res = append(res, ObjectInfo{Key: *cpy.Key, LastModified: *cpy.LastModified})
 			}
 		}
 	}
@@ -228,9 +260,9 @@ func (s Store) GetHeadObject(ctx context.Context, key string) (HeadObject, error
 	}
 
 	return HeadObject{
-		ContentLength: *head.ContentLength,
-		ContentType:   *head.ContentType,
-		LastModified:  *head.LastModified,
+		ContentLength: aws.ToInt64(head.ContentLength),
+		ContentType:   aws.ToString(head.ContentType),
+		LastModified:  aws.ToTime(head.LastModified),
 		Metadata:      head.Metadata,
 	}, nil
 }

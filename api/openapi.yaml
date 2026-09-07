@@ -13,7 +13,7 @@ info:
   license:
     name: MIT License
     url: https://github.com/OmniTrustILM/cbom-repository/blob/main/LICENSE.md
-  version: 0.1.0
+  version: 0.2.0
 
 externalDocs:
   description: ILM Documentation
@@ -76,23 +76,94 @@ paths:
                 $ref: "#/components/schemas/ProblemDetails"
     get:
       summary: Search BOMs created after a timestamp
+      description: |-
+        Lists BOM documents whose creation time (the object store's `LastModified`) is
+        strictly after `after`. Two modes:
+
+        **Unpaged (no `limit`)** — the original behaviour, unchanged byte for byte:
+        every matching document, in object-store listing order (key order), compared at
+        the store's full timestamp precision; documents without statistics metadata are
+        skipped, one with unreadable statistics metadata fails the call, and `warnings`
+        is never emitted.
+
+        **Paged (`limit` present)** — entries are ordered by the store's `LastModified`
+        at its native precision, then by object key, and the comparison with `after` is
+        done in whole seconds (the precision of `created_at`). `created_at` is derived
+        from that same listing timestamp, so advancing `after` by it is always safe.
+        While more entries remain, a page holds at least `limit` entries and is then
+        extended with every further entry that shares the last entry's second, so a
+        page never splits a second: the page size is `max(limit, entries in that
+        second)`, and `limit` bounds the per-call fan-out only while seconds are sparse
+        (a hard limit arrives with the keyset cursor, issue #144). A page shorter than
+        `limit` (including an empty one) is the last page. Objects whose key does not
+        follow the `<urn>-<version>` naming (possible only for objects written to the
+        bucket outside this API) are skipped with a warning in the service log: a key
+        with no `-` at all also fails the unpaged call, while a key whose version suffix
+        is not a positive integer or `original` is returned as-is by the unpaged call.
+
+        Client protocol for paged mode:
+
+        1. note the run start time (your clock, or the `Date` header of the first response)
+        2. `GET /v1/bom?after={watermark}&limit=N`
+        3. process the page — deduplicate on `(serialNumber, version)`
+        4. if fewer than N entries were returned, stop; otherwise set `after` to the
+           Unix time of the last entry's `created_at` and repeat from 2
+        5. within the run every object that was listable when its page was built is
+           yielded exactly once; an object overwritten during the run (its
+           `LastModified` moves) is yielded again under its new stamp — at-least-once,
+           exactly-once for objects not modified during the run
+        6. persist `watermark = run start − overlap` for the next run. The overlap must
+           cover clock skew between you and the object store, plus the longest upload
+           you expect, plus 1 s for the still-open second: S3 stamps a multipart upload
+           with its *initiation* time, so an object can become visible with a
+           `created_at` behind a page boundary you already passed. Do **not** derive the
+           watermark from the last `created_at`. Core uses 60 s. Re-reading is expected;
+           duplicates are the consumer's to drop.
+
+        Every call lists the whole bucket — the store cannot filter by time — so paging
+        bounds the per-call fan-out and response size, not the listing cost.
+
+        In paged mode, documents whose stored statistics are missing or unreadable are
+        returned with `cryptoStats: null` and a `warnings` code instead of being
+        omitted, and two further codes flag valid statistics that are shallow (stored
+        before nested components were counted) or truncated (document deeper than the
+        1000-level counting bound). See `StatsWarning`.
       operationId: getBOMs
       parameters:
         - name: after
           in: query
-          description: Unix timestamp
+          description: Unix timestamp (seconds). Only documents created strictly after it are returned.
           required: true
           schema:
             type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          description: >-
+            Page size (paged mode). Absent means the unpaged legacy behaviour. Must be
+            between 1 and 1000; larger values are rejected with 400, not clamped. The
+            response may contain more than `limit` entries when the last second is
+            completed (see the operation description).
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
       responses:
         "200":
-          description: Array of BOM entries (serialNumber + version)
+          description: Array of BOM entries, one per stored document version (`original` included).
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: '#/components/schemas/BOMEntry'
+        "400":
+          description: Bad Request (`after` missing or not a non-negative integer, or `limit` outside 1..1000)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         default:
           description: General Error
           content:
@@ -114,11 +185,15 @@ paths:
             example: "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79"
         - name: version
           in: query
-          description: Optional `version`. If omitted, returns latest version.
+          description: >-
+            Optional document version: a decimal integer without leading zeros, or the
+            literal `original` (the unmodified upload stored when the service assigned
+            the serial number). Any other non-empty value is rejected with 400. If
+            omitted, empty or whitespace-only, the highest numbered version is returned.
           required: false
           schema:
-            type: integer
-            example: 1
+            type: string
+            example: "1"
       responses:
         '200':
           description: Requested BOM
@@ -127,6 +202,12 @@ paths:
               schema:
                 type: string
                 format: binary
+        '400':
+          description: Invalid URN in the path, or `version` is neither a positive integer nor `original`
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '404':
           description: BOM not found
           content:
@@ -165,10 +246,22 @@ paths:
                   $ref: '#/components/schemas/BOMVersion'
         '400':
           description: Invalid URN supplied
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '404':
           description: BOM not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '500':
           description: Internal server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
 
   /v1/health:
     get:
@@ -284,7 +377,7 @@ components:
       required:
         - serialNumber
         - version
-        - timestamp
+        - created_at
         - cryptoStats
       properties:
         serialNumber:
@@ -293,15 +386,45 @@ components:
           example: "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79"
         version:
           type: string
-          description: BOM Version - number or `original` string
+          description: >-
+            Document version — a decimal integer, or the literal `original`. Paged mode
+            (`limit`) returns only entries whose stored key carries such a version; the
+            unpaged call returns whatever suffix the stored key has.
           example: "1"
-        timestamp:
+        created_at:
           type: string
           format: date-time
-          description: RFC 3339 timestamp when this BOM entry was created
+          description: RFC 3339 timestamp (UTC, second precision) when this document version was stored.
           example: "2026-01-25T21:35:05Z"
         cryptoStats:
-          $ref: '#/components/schemas/CryptoStats'
+          description: >-
+            Cryptographic asset statistics. Never null in the unpaged call; in paged
+            mode null when they could not be read (see `warnings`).
+          anyOf:
+            - $ref: '#/components/schemas/CryptoStats'
+            - type: "null"
+        warnings:
+          type: array
+          description: >-
+            Paged mode only; present when something about the entry needs the
+            consumer's attention. `crypto-stats-missing`: the stored object carries no
+            statistics metadata; `crypto-stats-invalid`: the statistics metadata is not
+            valid JSON — in both cases `cryptoStats` is null and the document itself is
+            still retrievable. `crypto-stats-shallow`: the object was stored before
+            nested components were counted, so the (valid) counts cover the top-level
+            `components` array only. `crypto-stats-truncated`: the document nests deeper
+            than 1000 levels and the counts stop there. Order: missing or invalid first,
+            then shallow, then truncated.
+          items:
+            $ref: '#/components/schemas/StatsWarning'
+
+    StatsWarning:
+      type: string
+      enum:
+        - crypto-stats-missing
+        - crypto-stats-invalid
+        - crypto-stats-shallow
+        - crypto-stats-truncated
 
     BOMCreateResponse:
       $schema: https://json-schema.org/draft/2020-12/schema
@@ -325,15 +448,17 @@ components:
       type: object
       required:
         - version
-        - timestamp
+        - created_at
         - cryptoStats
       properties:
         version:
           type: string
+          description: Document version — a decimal integer, or the literal `original`.
           example: "1"
-        timestamp:
+        created_at:
           type: string
           format: date-time
+          description: RFC 3339 timestamp (UTC, second precision) when this document version was stored.
           example: "2026-01-19T21:35:05Z"
         cryptoStats:
           $ref: '#/components/schemas/CryptoStats'
@@ -378,6 +503,12 @@ components:
 
     CryptoAssets:
       type: object
+      description: >-
+        Counts of components of type `cryptographic-asset` by `cryptoProperties.assetType`.
+        The whole `components` tree is counted (nested components included); documents
+        stored before that fix carry a shallow count of the top-level array only. The
+        stored object's S3 user metadata `crypto-stats-version` is `2` for tree counts and
+        absent for legacy shallow counts.
       required:
         - total
         - algorithms

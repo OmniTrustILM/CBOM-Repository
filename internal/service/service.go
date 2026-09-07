@@ -27,6 +27,44 @@ var (
 	ErrNotFound      = errors.New("not found")
 )
 
+// Warning codes attached to a paged search entry whose statistics could not be read, or
+// could be read but do not describe the whole document. The entry is still returned — a
+// document the consumer cannot see is worse than one flagged. Legacy (unpaged) mode
+// never sets warnings; see searchLegacy for why.
+//
+// An entry carries at most one of missing|invalid (its `cryptoStats` is then null) and,
+// when the statistics are readable, shallow and/or truncated — always in the order
+// missing|invalid, shallow, truncated.
+const (
+	// WarningCryptoStatsMissing: the object carries no crypto-stats metadata.
+	WarningCryptoStatsMissing = "crypto-stats-missing"
+	// WarningCryptoStatsInvalid: the crypto-stats metadata value is not valid JSON.
+	WarningCryptoStatsInvalid = "crypto-stats-invalid"
+	// WarningCryptoStatsShallow: the statistics are valid but carry no
+	// store.MetaCryptoStatsVersionKey, so they are the legacy shallow count over the
+	// top-level `components` array only — nested components were not counted.
+	WarningCryptoStatsShallow = "crypto-stats-shallow"
+	// WarningCryptoStatsTruncated: the statistics are valid but the component walk
+	// that produced them stopped at maxComponentDepth, so the counts are a lower
+	// bound (store.MetaCryptoStatsTruncatedKey is "true").
+	WarningCryptoStatsTruncated = "crypto-stats-truncated"
+)
+
+// MaxSearchLimit is the largest page size GET /v1/bom accepts for `limit`.
+//
+// `limit` is a soft floor, not a ceiling: the never-split-a-second rule (see
+// searchPaged) keeps a page growing until the second that filled it is exhausted, so a
+// page holds at least `limit` entries and every remaining entry of its last second —
+// its size is max(limit, entries in that second). Each entry costs one HEAD request, so
+// `limit` bounds a call's HEAD fan-out only when seconds are sparse; one dense second
+// can push a page (and its fan-out) well past the cap, which searchPaged logs. A hard
+// per-page bound needs the keyset cursor tracked in issue #144.
+//
+// The cap does not bound the LIST side either: store.Search still lists the whole bucket
+// on every call regardless of `limit`. Requests above the cap are rejected rather than
+// clamped, so a consumer's "fewer than limit entries → last page" rule stays valid.
+const MaxSearchLimit = 1000
+
 //go:embed schemas
 var schemas embed.FS
 
@@ -171,27 +209,38 @@ func (s Service) VersionSupported(version string) bool {
 }
 
 type SearchRes struct {
-	SerialNumber string      `json:"serialNumber"`
-	Version      string      `json:"version"`
-	Timestamp    string      `json:"created_at"`
-	CryptoStats  CryptoStats `json:"cryptoStats"`
+	SerialNumber string `json:"serialNumber"`
+	Version      string `json:"version"`
+	Timestamp    string `json:"created_at"`
+	// CryptoStats is null only in paged mode, when the statistics could not be read;
+	// Warnings then says why. Legacy mode never emits an entry without statistics.
+	CryptoStats *CryptoStats `json:"cryptoStats"`
+	// Warnings lists WarningCryptoStats* codes and is set in paged mode only (see
+	// searchLegacy). Omitted when empty, so an entry with valid statistics keeps the
+	// legacy wire format byte for byte.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
-// Search retrieves all BOMs with a last modified timestamp greater than the specified value.
-// The function queries the underlying store for matching BOMs and enriches each result with
-// cryptographic asset statistics extracted from object metadata.
+// Search retrieves BOMs with a last modified timestamp greater than the specified value
+// and enriches each result with cryptographic asset statistics extracted from object
+// metadata.
+//
+// limit <= 0 selects the legacy, unpaged behaviour: every matching object, in listing
+// order, LastModified compared at full precision, statistics that cannot be read
+// skipping the object or failing the call — see searchLegacy. limit > 0 selects paged
+// mode, where such an object stays visible with a warning code instead; see searchPaged.
 //
 // Parameters:
 //   - ctx: Context for cancellation, deadlines, and additional slog fields.
 //   - ts: Unix timestamp (seconds since epoch); only BOMs modified after this time are returned
+//   - limit: page size for paged mode (the handler enforces 1..MaxSearchLimit), or <= 0 for legacy mode
 //
 // Returns:
 //   - []SearchRes: Slice of search results containing serial number, version, timestamp, and crypto statistics
-//   - error: Non-nil if the store query fails, key format is invalid, or JSON unmarshaling fails
-func (s Service) Search(ctx context.Context, ts int64) ([]SearchRes, error) {
-	res := []SearchRes{}
-
-	ctx = log.ContextAttrs(ctx, slog.Int64("timestamp", ts))
+//   - error: Non-nil if the store query fails or, in legacy mode, a key does not follow
+//     the naming invariant or its statistics are not valid JSON
+func (s Service) Search(ctx context.Context, ts int64, limit int) ([]SearchRes, error) {
+	ctx = log.ContextAttrs(ctx, slog.Int64("timestamp", ts), slog.Int("limit", limit))
 	slog.DebugContext(ctx, "Calling `store.Search()`.")
 
 	r, err := s.store.Search(ctx, ts)
@@ -201,51 +250,317 @@ func (s Service) Search(ctx context.Context, ts int64) ([]SearchRes, error) {
 
 	slog.DebugContext(ctx, "`store.Search()` finished.",
 		slog.Int("count", len(r)),
-		slog.String("value", strings.Join(r, ",")),
+		slog.String("value", strings.Join(objectKeys(r), ",")),
 	)
 
-	for _, cpy := range r {
-		idx := strings.LastIndex(cpy, "-")
-		if idx == -1 {
+	if limit <= 0 {
+		return s.searchLegacy(ctx, r)
+	}
+	return s.searchPaged(ctx, r, ts, limit)
+}
+
+// searchLegacy is the unpaged search: every listed object, in listing order, one HEAD
+// each. Its result is what the endpoint returned before paging existed, entry for entry:
+//
+//   - a key that violates the naming invariant fails the call;
+//   - an object that vanished between LIST and HEAD is skipped with a warning;
+//   - an object without crypto-stats metadata is skipped with a warning;
+//   - unparseable statistics fail the call (with the entries collected so far).
+//
+// Warnings are deliberately never set here. The legacy caller skips an entry whose
+// `cryptoStats` is null and still advances its watermark past it, so a warning entry
+// would turn today's loud skip into a silent, permanent miss; paged mode (searchPaged)
+// is where warnings belong, because its consumers were written against them.
+func (s Service) searchLegacy(ctx context.Context, objects []store.ObjectInfo) ([]SearchRes, error) {
+	res := []SearchRes{}
+	for _, obj := range objects {
+		serialNumber, version, ok := splitObjectKey(obj.Key)
+		if !ok {
 			slog.ErrorContext(ctx, "Key does NOT adhere to the naming invariant.",
-				slog.String("key", cpy), slog.String("expected-format", "urn:uuid:<uuid>-<version>"))
+				slog.String("key", obj.Key), slog.String("expected-format", "urn:uuid:<uuid>-<version>"))
 			return nil, errors.New("unexpected key returned from store")
 		}
 
-		head, err := s.store.GetHeadObject(ctx, cpy)
+		head, err := s.store.GetHeadObject(ctx, obj.Key)
 		switch {
 		case errors.Is(err, store.ErrNotFound):
-			slog.WarnContext(ctx, fmt.Sprintf("Fetching HeadObject for key %q failed although version was previously returned by `store.Search()`. Skipping from result set.", cpy))
+			slog.WarnContext(ctx, fmt.Sprintf("Fetching HeadObject for key %q failed although version was previously returned by `store.Search()`. Skipping from result set.", obj.Key))
 			continue
 
 		case err != nil:
 			return nil, err
 		}
 
-		cryptoStatsValue, ok := head.Metadata[store.MetaCryptoStatsKey]
-		if !ok {
-			slog.WarnContext(ctx,
-				fmt.Sprintf("There is no key %q in object metadata. Skipping from result set.", store.MetaCryptoStatsKey),
-				slog.String("object-key", cpy))
+		cryptoStats, found, err := legacyStats(ctx, obj.Key, head.Metadata)
+		if err != nil {
+			// Mirrors the pre-paging contract: the entries collected so far are
+			// returned alongside the error.
+			return res, err
+		}
+		if !found {
 			continue
 		}
 
-		var cryptoStats CryptoStats
-		if err := json.Unmarshal([]byte(cryptoStatsValue), &cryptoStats); err != nil {
-			slog.ErrorContext(ctx,
-				fmt.Sprintf("Unmarshaling metadata key %q value failed.", store.MetaCryptoStatsKey),
-				slog.String("error", err.Error()), slog.String("object-key", cpy))
-			return res, errors.New("unmarshaling json failed")
-		}
-
 		res = append(res, SearchRes{
-			SerialNumber: cpy[:idx],
-			Version:      cpy[idx+1:],
-			Timestamp:    head.LastModified.Format(time.RFC3339),
-			CryptoStats:  cryptoStats,
+			SerialNumber: serialNumber,
+			Version:      version,
+			Timestamp:    legacyCreatedAt(head, obj),
+			CryptoStats:  &cryptoStats,
 		})
 	}
 	return res, nil
+}
+
+// legacyStats reads the crypto statistics of one object the way the unpaged search
+// always has: a missing metadata key means "skip this object" (found is false, logged
+// as a warning), an unparseable value means "fail the call".
+func legacyStats(ctx context.Context, key string, metadata map[string]string) (CryptoStats, bool, error) {
+	raw, ok := metadata[store.MetaCryptoStatsKey]
+	if !ok {
+		slog.WarnContext(ctx, fmt.Sprintf("There is no key %q in object metadata. Skipping from result set.", store.MetaCryptoStatsKey),
+			slog.String("object-key", key))
+		return CryptoStats{}, false, nil
+	}
+
+	var cryptoStats CryptoStats
+	if err := json.Unmarshal([]byte(raw), &cryptoStats); err != nil {
+		slog.ErrorContext(ctx, fmt.Sprintf("Unmarshaling metadata key %q value failed.", store.MetaCryptoStatsKey),
+			slog.String("error", err.Error()), slog.String("object-key", key))
+		return CryptoStats{}, false, errors.New("unmarshaling json failed")
+	}
+	return cryptoStats, true, nil
+}
+
+// legacyCreatedAt renders an entry's created_at at RFC 3339 second precision. The HEAD
+// Last-Modified header is the clock, as it always was; when the store answers HEAD
+// without one — store.GetHeadObject then yields the zero time rather than panicking —
+// the LIST timestamp of the same object is used, so created_at is never the year-1
+// instant a consumer would treat as "the beginning of time".
+func legacyCreatedAt(head store.HeadObject, obj store.ObjectInfo) string {
+	if head.LastModified.IsZero() {
+		return obj.LastModified.UTC().Format(time.RFC3339)
+	}
+	return head.LastModified.Format(time.RFC3339)
+}
+
+// pagedCandidates selects and orders the objects searchPaged consumes:
+//
+//  1. Only objects whose LastModified *second* is after ts are candidates — the same
+//     granularity as created_at, so MinIO's sub-second values cannot leak an object of
+//     the `after` second into the next page.
+//  2. Candidates are ordered by (LastModified, key); ties are impossible.
+func pagedCandidates(objects []store.ObjectInfo, ts int64) []store.ObjectInfo {
+	candidates := make([]store.ObjectInfo, 0, len(objects))
+	for _, obj := range objects {
+		if obj.LastModified.Unix() > ts {
+			candidates = append(candidates, obj)
+		}
+	}
+	slices.SortFunc(candidates, func(a, b store.ObjectInfo) int {
+		if c := a.LastModified.Compare(b.LastModified); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Key, b.Key)
+	})
+	return candidates
+}
+
+// searchPaged returns one page of the feed. The rules exist so that a consumer can
+// advance `after` to the last entry's created_at (whole seconds) without skipping
+// entries, on AWS S3 and MinIO alike:
+//
+//  1. Candidates come from pagedCandidates: second-granularity filter on ts, ordered
+//     by (LastModified, key).
+//  2. Once `limit` entries are collected, the page keeps growing only while the next
+//     candidate sits in the same second as the entry that filled the page ("never split
+//     a second"). `limit` is therefore a floor, not a ceiling (see MaxSearchLimit); a
+//     page that outgrows twice `limit` is logged, since a second dense enough to do
+//     that also multiplies the call's HEAD fan-out.
+//  3. Candidates that are skipped do not count toward `limit` and never fail the call:
+//     an object that vanished between LIST and HEAD, a key that does not follow the
+//     naming invariant, and a key whose version suffix is not one this service writes
+//     (see ValidVersion) — the last two are logged as warnings. Legacy mode still
+//     returns keys with a foreign version suffix; only paged consumers, which fetch by
+//     (serialNumber, version), are protected from an entry they could not fetch.
+//  4. A page shorter than `limit` is the last one. Everything else (HEAD errors,
+//     statistics warnings) behaves as in pagedEntry.
+//  5. created_at is overwritten with the LIST LastModified (obj.LastModified) that
+//     decided the boundary above, instead of the HEAD LastModified pagedEntry set it
+//     to. The boundary and created_at must come from the same clock: if HEAD reports a
+//     different second than LIST (an unguarded overwrite landing between LIST and HEAD
+//     — e.g. via uploadCaseSNValidVersionInvalid — or a store whose HTTP-date rounding
+//     differs from its listing precision), a consumer advancing `after` to the last
+//     created_at must never be able to outrun the boundary the next page is filtered
+//     against.
+func (s Service) searchPaged(ctx context.Context, objects []store.ObjectInfo, ts int64, limit int) ([]SearchRes, error) {
+	res := []SearchRes{}
+	var pageFull bool
+	var boundary int64 // second of the entry that filled the page; meaningful only while pageFull
+	for _, obj := range pagedCandidates(objects, ts) {
+		second := obj.LastModified.Unix()
+		if pageFull && second != boundary {
+			break
+		}
+
+		serialNumber, version, ok := pagedKey(ctx, obj.Key)
+		if !ok {
+			continue
+		}
+
+		entry, found, err := s.pagedEntry(ctx, obj.Key, serialNumber, version)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		// The boundary above is computed from the LIST LastModified (obj.LastModified);
+		// created_at must come from that same clock, not from pagedEntry's HEAD
+		// LastModified, so a consumer advancing `after` by created_at can never outrun
+		// the boundary the next page is filtered against.
+		entry.Timestamp = obj.LastModified.UTC().Format(time.RFC3339)
+		res = append(res, entry)
+		if len(res) >= limit {
+			pageFull = true
+			boundary = second
+		}
+	}
+	warnDensePage(ctx, limit, len(res), boundary)
+	return res, nil
+}
+
+// warnDensePage logs a page the never-split-a-second rule grew past twice `limit`. Such
+// a page also cost more than twice `limit` HEAD requests, so the log names the second
+// responsible: a single second dense enough to do this is the signal that this endpoint
+// needs the keyset cursor of issue #144, not a smaller `limit`.
+func warnDensePage(ctx context.Context, limit, size int, boundary int64) {
+	if size <= 2*limit {
+		return
+	}
+	slog.WarnContext(ctx, "Page grew past twice the requested limit to avoid splitting a second.",
+		slog.Int("limit", limit),
+		slog.Int("page-size", size),
+		slog.String("boundary-second", time.Unix(boundary, 0).UTC().Format(time.RFC3339)))
+}
+
+// pagedKey splits a listed key into (serialNumber, version) for paged mode. ok is false
+// for a key paged mode must not surface: one that does not follow the naming invariant,
+// and one whose version suffix is not a version this service writes — a consumer fetches
+// entries by (serialNumber, version), so an entry it could not fetch is worse than none.
+// Both are logged and skipped rather than failing the page.
+func pagedKey(ctx context.Context, key string) (serialNumber, version string, ok bool) {
+	serialNumber, version, ok = splitObjectKey(key)
+	if !ok {
+		slog.WarnContext(ctx, "Key does NOT adhere to the naming invariant. Skipping from paged result set.",
+			slog.String("key", key), slog.String("expected-format", "urn:uuid:<uuid>-<version>"))
+		return "", "", false
+	}
+	if !ValidVersion(version) {
+		slog.WarnContext(ctx, "Key version suffix is not a positive integer or \"original\". Skipping from paged result set.",
+			slog.String("key", key), slog.String("version", version), slog.String("expected-format", "urn:uuid:<uuid>-<version>"))
+		return "", "", false
+	}
+	return serialNumber, version, true
+}
+
+// pagedEntry builds a paged search entry for one listed object from its HEAD metadata.
+// found is false when the object vanished between LIST and HEAD; the caller skips it.
+// Statistics that cannot be read, or that do not describe the whole document, become
+// warnings rather than a dropped entry or a failed call.
+func (s Service) pagedEntry(ctx context.Context, key, serialNumber, version string) (SearchRes, bool, error) {
+	head, err := s.store.GetHeadObject(ctx, key)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		slog.WarnContext(ctx, fmt.Sprintf("Fetching HeadObject for key %q failed although version was previously returned by `store.Search()`. Skipping from result set.", key))
+		return SearchRes{}, false, nil
+
+	case err != nil:
+		return SearchRes{}, false, err
+	}
+
+	cryptoStats, warnings := statsFromMetadata(ctx, key, head.Metadata)
+	return SearchRes{
+		SerialNumber: serialNumber,
+		Version:      version,
+		Timestamp:    head.LastModified.Format(time.RFC3339),
+		CryptoStats:  cryptoStats,
+		Warnings:     pagedWarnings(head, cryptoStats, warnings),
+	}, true, nil
+}
+
+// pagedWarnings completes the warning list of a paged entry: `codes` holds what reading
+// the statistics produced (missing or invalid, at most one), to which the metadata flags
+// add shallow and truncated — in that order. Both only qualify statistics that were read
+// successfully, so an entry whose `cryptoStats` is null keeps its single code.
+func pagedWarnings(head store.HeadObject, cryptoStats *CryptoStats, codes []string) []string {
+	if cryptoStats == nil {
+		return codes
+	}
+	if _, ok := head.Metadata[store.MetaCryptoStatsVersionKey]; !ok {
+		codes = append(codes, WarningCryptoStatsShallow)
+	}
+	if head.Metadata[store.MetaCryptoStatsTruncatedKey] == "true" {
+		codes = append(codes, WarningCryptoStatsTruncated)
+	}
+	return codes
+}
+
+// statsFromMetadata reads the crypto statistics stored in object metadata for paged
+// mode. When the key is missing or its value is not valid JSON it returns nil statistics
+// and the matching warning code, so the entry is surfaced instead of being dropped or
+// failing the page. Legacy mode uses legacyStats, which skips or fails instead.
+func statsFromMetadata(ctx context.Context, key string, metadata map[string]string) (*CryptoStats, []string) {
+	raw, ok := metadata[store.MetaCryptoStatsKey]
+	if !ok {
+		slog.WarnContext(ctx, fmt.Sprintf("There is no key %q in object metadata. Returning the entry with a warning.", store.MetaCryptoStatsKey),
+			slog.String("object-key", key))
+		return nil, []string{WarningCryptoStatsMissing}
+	}
+
+	var cryptoStats CryptoStats
+	if err := json.Unmarshal([]byte(raw), &cryptoStats); err != nil {
+		slog.ErrorContext(ctx, fmt.Sprintf("Unmarshaling metadata key %q value failed. Returning the entry with a warning.", store.MetaCryptoStatsKey),
+			slog.String("error", err.Error()), slog.String("object-key", key))
+		return nil, []string{WarningCryptoStatsInvalid}
+	}
+	return &cryptoStats, nil
+}
+
+// ValidVersion reports whether s is a version this service writes: a decimal integer
+// greater than zero and without leading zeros, or the literal "original". It is the one
+// definition of the rule — the HTTP layer rejects a `version` query parameter that fails
+// it, and paged search skips a key whose suffix does.
+func ValidVersion(s string) bool {
+	if s == "original" {
+		return true
+	}
+	if s == "" || s[0] == '0' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// splitObjectKey splits an object key `<urn>-<version>` at its last '-' into the serial
+// number (URN) and the version suffix (a decimal integer or "original").
+func splitObjectKey(key string) (serialNumber, version string, ok bool) {
+	idx := strings.LastIndex(key, "-")
+	if idx == -1 {
+		return "", "", false
+	}
+	return key[:idx], key[idx+1:], true
+}
+
+func objectKeys(objects []store.ObjectInfo) []string {
+	keys := make([]string, 0, len(objects))
+	for _, obj := range objects {
+		keys = append(keys, obj.Key)
+	}
+	return keys
 }
 
 // GetBOMByUrn retrieves a BOM document by its URN and version.
@@ -320,8 +635,12 @@ func (s Service) GetBOMByUrn(ctx context.Context, urn, version string) ([]byte, 
 }
 
 type VersionRes struct {
-	Version     string      `json:"version"`
-	Timestamp   string      `json:"created_at"`
+	Version   string `json:"version"`
+	Timestamp string `json:"created_at"`
+	// CryptoStats is a value, never null: a version whose statistics cannot be read is
+	// left out of the response (see UrnVersions). GET /v1/bom/{urn}/versions is a
+	// browse endpoint with no watermark behind it, so dropping an unreadable version
+	// cannot move a consumer's cursor past it the way it could on the search feed.
 	CryptoStats CryptoStats `json:"cryptoStats"`
 }
 
@@ -332,7 +651,8 @@ type VersionRes struct {
 // The returned slice includes all numbered versions (e.g., "1", "2", "3") and
 // may also include an "original" version if one exists in the store. Versions
 // that exist in the store but are missing required metadata (such as crypto
-// statistics) are logged as warnings and excluded from the results.
+// statistics) are logged as warnings and excluded from the results; unparseable
+// statistics fail the call.
 //
 // Parameters:
 //   - ctx: Context for cancellation, deadlines, and additional slog fields
