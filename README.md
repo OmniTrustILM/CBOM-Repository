@@ -103,7 +103,7 @@ watermark = unix(run_start) - overlap  # overlap >= clock skew + longest upload 
 
 Within a run, advancing `after` by the last `created_at` is safe because a page never splits a second: every object that was listable when its page was built is yielded exactly once, and an object overwritten during the run (its `LastModified` moves) is yielded again under its new stamp — at-least-once, exactly-once for objects not modified during the run. Between runs the watermark must go back to the *start* of the previous run, not to the last `created_at`: an upload that completed while the run was already past its second — the still-open second, or a multipart upload, which S3 stamps with its **initiation** time — is only picked up by a run that starts behind it. The overlap therefore has to cover clock skew plus the longest upload you expect. Duplicates across runs are expected and deduplication is the consumer's job (Core deduplicates on `(serialNumber, version)` and already uses "job start − 60 s").
 
-Every call lists the whole bucket — an object store cannot filter by time — so paging bounds the per-call `HEAD` fan-out and response size, not the listing cost. The design decision on a real change feed (cursor, sequence or webhook) is in [docs/design/2026-09-02-change-feed-decision.md](./docs/design/2026-09-02-change-feed-decision.md).
+Every call lists the whole bucket — an object store cannot filter by time — so paging bounds the per-call `HEAD` fan-out and response size, not the listing cost. The change-feed decision (keyset cursor next, tracked as #144; sequence and webhook rejected for the current epic) was ratified on [#138](https://github.com/OmniTrustILM/cbom-repository/issues/138#issuecomment-5540800814).
 
 #### Warnings (paged mode only)
 

@@ -20,7 +20,8 @@ import (
 //   - "2": the whole `components` tree is walked (see walkComponents).
 //
 // Consumers that need exact counts for version-1 objects recount from the document;
-// see docs/design/2026-09-02-change-feed-decision.md ("stats backfill").
+// see the #138 decision (https://github.com/OmniTrustILM/cbom-repository/issues/138#issuecomment-5540800814):
+// the repository does not rewrite stored objects, Core recounts during asset ingest.
 const CryptoStatsVersion = "2"
 
 // maxComponentDepth bounds how deep walkComponents descends into nested `components`.
