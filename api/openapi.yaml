@@ -13,7 +13,7 @@ info:
   license:
     name: MIT License
     url: https://github.com/OmniTrustILM/cbom-repository/blob/main/LICENSE.md
-  version: 0.2.0
+  version: 0.3.0
 
 externalDocs:
   description: ILM Documentation
@@ -75,83 +75,184 @@ paths:
               schema:
                 $ref: "#/components/schemas/ProblemDetails"
     get:
-      summary: Search BOMs created after a timestamp
+      summary: Search BOMs created after a timestamp, paged with a cursor
       description: |-
         Lists BOM documents whose creation time (the object store's `LastModified`) is
-        strictly after `after`. Two modes:
+        strictly after a position given by exactly one of `after` (a Unix timestamp) or
+        `cursor` (an opaque continuation token from the previous page's `Link` header).
+        Three modes:
 
         **Unpaged (no `limit`)** — the original behaviour, unchanged byte for byte:
         every matching document, in object-store listing order (key order), compared at
         the store's full timestamp precision; documents without statistics metadata are
         skipped, one with unreadable statistics metadata fails the call, and `warnings`
-        is never emitted.
+        is never emitted. No `Link` header is ever sent.
 
-        **Paged (`limit` present)** — entries are ordered by the store's `LastModified`
-        at its native precision, then by object key, and the comparison with `after` is
-        done in whole seconds (the precision of `created_at`). `created_at` is derived
-        from that same listing timestamp, so advancing `after` by it is always safe.
-        While more entries remain, a page holds at least `limit` entries and is then
-        extended with every further entry that shares the last entry's second, so a
-        page never splits a second: the page size is `max(limit, entries in that
-        second)`, and `limit` bounds the per-call fan-out only while seconds are sparse
-        (a hard limit arrives with the keyset cursor, issue #144). A page shorter than
-        `limit` (including an empty one) is the last page. Objects whose key does not
-        follow the `<urn>-<version>` naming (possible only for objects written to the
-        bucket outside this API) are skipped with a warning in the service log: a key
-        with no `-` at all also fails the unpaged call, while a key whose version suffix
-        is not a positive integer or `original` is returned as-is by the unpaged call.
+        **Paged, `after` + `limit` (opens a run)** — the body is unchanged from the
+        earlier paged behaviour (byte for byte on every store whose listing stamps are at
+        most millisecond-precise, which is every known S3 implementation): entries are
+        ordered by the store's `LastModified` at millisecond precision (the finest an S3
+        listing carries, and the precision the cursor records), then by object key, and
+        the comparison with `after` is done in whole seconds (the precision of
+        `created_at`).
+        `created_at` is derived from that same listing timestamp, so advancing `after`
+        by it is always safe. While more entries remain, a page holds at least `limit`
+        entries and is then extended with every further entry that shares the last
+        entry's second, so a page never splits a second: the limit is soft, the page
+        size is `max(limit, entries in that second)`, and `limit` bounds the per-call
+        fan-out only while seconds are sparse. When the page stopped before the end of
+        the listing, the response carries a `Link` header with `rel="next"` (see below);
+        when it examined everything the header is absent and the run is complete.
 
-        Client protocol for paged mode:
+        **Paged, `cursor` + `limit` (continues a run)** — the page holds exactly `limit`
+        entries while candidates remain, fewer (possibly zero) on the last page: the
+        limit is hard, no second-completion. Candidates are the listed objects whose
+        pair `(LastModified, key)` is strictly greater than the cursor's pair, ordered
+        by `(LastModified asc, key asc)`. Comparison and ordering are at millisecond
+        granularity (the finest precision an S3 listing carries: seconds on AWS S3,
+        milliseconds on MinIO) with the object key as tie-break, so page boundaries are
+        exact and unique. `Link` with `rel="next"` is present when the page stopped
+        before the end of the listing and absent when it examined everything.
+        `created_at` is derived from the listing `LastModified` (second precision), as on
+        the `after` page.
+
+        In both paged modes, objects whose key does not follow the `<urn>-<version>`
+        naming (possible only for objects written to the bucket outside this API) or
+        whose version suffix is not a positive integer or `original`, and objects that
+        vanish between the listing and their `HEAD`, are skipped with a warning in the
+        service log; skipped candidates do not count toward `limit`. (A key with no `-`
+        at all also fails the unpaged call, while a key whose version suffix is not a
+        positive integer or `original` is returned as-is by the unpaged call.) A page
+        shorter than `limit` (including an empty one) is the last page in both modes;
+        the converse is not guaranteed (a `cursor` page of exactly `limit` entries may
+        be the last one), so the absence of `Link`, not the page size, says the run is
+        complete. A `Link` can lead to an empty last page when the remaining listed
+        objects are skipped or have vanished.
+
+        The cursor token is opaque: echo it back unchanged, never construct or modify
+        it. The server encodes `v1|<LastModified in Unix milliseconds>|<key>` of the
+        page's last entry — the listing's timestamp, not the `HEAD` one — as
+        base64url without padding; the key comes last so a `|` inside a key cannot
+        break parsing. A cursor is valid within a run only — do not persist it across
+        runs or across a store migration; between runs use the watermark rule below.
+
+        The `Link` header (RFC 8288) is a relative-path reference to this resource, never
+        an absolute URL: `Link: <bom?cursor=<token>&limit=<N>>; rel="next"`. Resolve it
+        against the URL you just requested (RFC 3986 §5.2 — `URI.resolve` in Java,
+        `URL.ResolveReference` in Go, `urljoin` in Python): the result is your own URL
+        for this operation — with whatever prefix the deployment mounts the API under
+        (`/api` by default), and with any prefix an ingress strips before the request
+        reaches the service — plus the query `cursor=<token>&limit=<N>`. Scheme and host
+        are not guessed behind proxies, and the service's own path is not repeated (it
+        would be wrong exactly when a prefix was stripped). A client that builds URLs
+        from a configured base can equally append the target's query string to its own
+        URL for this operation — which is also the way through a proxy that rewrites the
+        last path segment, since the reference relies on what the documented paths
+        guarantee: your URL ends in the `bom` segment, without a trailing slash. The
+        body stays a JSON array of `BOMEntry`; there is no envelope.
+
+        Client protocol (recommended):
 
         1. note the run start time (your clock, or the `Date` header of the first response)
         2. `GET /v1/bom?after={watermark}&limit=N`
         3. process the page — deduplicate on `(serialNumber, version)`
-        4. if fewer than N entries were returned, stop; otherwise set `after` to the
-           Unix time of the last entry's `created_at` and repeat from 2
+        4. if the response carries a `Link` header with `rel="next"`, resolve its target
+           against the URL you requested and `GET` it (your `/v1/bom` URL with
+           `?cursor=...&limit=N`, same `N`), then repeat from 3; otherwise stop
         5. within the run every object that was listable when its page was built is
-           yielded exactly once; an object overwritten during the run (its
-           `LastModified` moves) is yielded again under its new stamp — at-least-once,
-           exactly-once for objects not modified during the run
+           yielded exactly once; an object overwritten during the run moves to a new
+           `(LastModified, key)` position and is yielded again under its new stamp if
+           that position is still ahead of the run, otherwise the next run picks it up
+           — at-least-once, exactly-once for objects not modified during the run
         6. persist `watermark = run start − overlap` for the next run. The overlap must
            cover clock skew between you and the object store, plus the longest upload
            you expect, plus 1 s for the still-open second: S3 stamps a multipart upload
            with its *initiation* time, so an object can become visible with a
            `created_at` behind a page boundary you already passed. Do **not** derive the
-           watermark from the last `created_at`. Core uses 60 s. Re-reading is expected;
-           duplicates are the consumer's to drop.
+           watermark from the last `created_at` or from a cursor. Core uses 60 s. The
+           overlap is the client's; the server has no overlap parameter. Re-reading
+           across runs is expected; duplicates are the consumer's to drop.
+        7. a run that fails — any non-2xx response, including a 400 from a replica that
+           does not know `cursor` yet during a rolling upgrade — must not advance the
+           watermark; retry the whole run from `after`
+
+        The earlier protocol — advancing `after` by the last entry's `created_at` and
+        stopping on a page shorter than `limit` — keeps working unchanged for consumers
+        that do not follow `Link`; following `Link` is recommended because pages are
+        then exactly `limit` and boundaries are exact.
 
         Every call lists the whole bucket — the store cannot filter by time — so paging
         bounds the per-call fan-out and response size, not the listing cost.
 
-        In paged mode, documents whose stored statistics are missing or unreadable are
-        returned with `cryptoStats: null` and a `warnings` code instead of being
+        In both paged modes, documents whose stored statistics are missing or unreadable
+        are returned with `cryptoStats: null` and a `warnings` code instead of being
         omitted, and two further codes flag valid statistics that are shallow (stored
         before nested components were counted) or truncated (document deeper than the
         1000-level counting bound). See `StatsWarning`.
+
+        Requests are rejected with 400 (`application/problem+json`) when `cursor` is
+        given without `limit`; when `cursor` and `after` are combined (a run opens with
+        `after` and continues with `cursor`); when `cursor` is malformed — not
+        base64url, wrong version tag, missing fields, non-numeric or negative timestamp,
+        empty key, empty value, or otherwise not canonical; when `limit`
+        is outside 1..1000 (rejected, not clamped); or when, without `cursor`, `after`
+        is missing or not a non-negative integer.
       operationId: getBOMs
       parameters:
         - name: after
           in: query
-          description: Unix timestamp (seconds). Only documents created strictly after it are returned.
-          required: true
+          description: >-
+            Unix timestamp (seconds). Only documents created strictly after it are
+            returned. Required unless `cursor` is given; cannot be combined with
+            `cursor` (a run opens with `after` and continues with `cursor`). Exactly
+            one of `after` and `cursor` must be present.
+          required: false
           schema:
             type: integer
             minimum: 0
         - name: limit
           in: query
           description: >-
-            Page size (paged mode). Absent means the unpaged legacy behaviour. Must be
-            between 1 and 1000; larger values are rejected with 400, not clamped. The
-            response may contain more than `limit` entries when the last second is
-            completed (see the operation description).
+            Page size (paged mode). Absent means the unpaged legacy behaviour; required
+            when `cursor` is given. Must be between 1 and 1000; values outside that
+            range are rejected with 400, not clamped. Soft on the `after` page, where
+            the response may contain more than `limit` entries when the last second is
+            completed (see the operation description); hard on `cursor` pages, which
+            hold exactly `limit` entries while candidates remain.
           required: false
           schema:
             type: integer
             minimum: 1
             maximum: 1000
+        - name: cursor
+          in: query
+          description: >-
+            Opaque continuation token copied from the previous response's `Link`
+            header (`rel="next"`). Requires `limit`; cannot be combined with `after`.
+            Valid within a run only, so do not persist it across runs or across a store
+            migration. Echo it back unchanged; a token not in the canonical form the
+            service issues is rejected with 400 (it is a position, not a credential:
+            it is not signed).
+          required: false
+          schema:
+            type: string
       responses:
         "200":
           description: Array of BOM entries, one per stored document version (`original` included).
+          headers:
+            Link:
+              description: >-
+                Paged modes only (`after` + `limit` and `cursor` + `limit`); never sent
+                by the unpaged call. Present when this page stopped before the end of
+                the listing (the next page can still be empty), absent when it examined
+                everything — the run is complete. An RFC 8288 link with `rel="next"`
+                whose target is a relative-path reference to this resource
+                (`bom?cursor=<token>&limit=<N>`, same `N`): resolve it against the
+                request URL (RFC 3986) to get your own URL for this operation with the
+                continuation query. The token is opaque and valid within the run only.
+              schema:
+                type: string
+              example: '<bom?cursor=djF8MTc4ODQ1MTIwMDAwMHx1cm46dXVpZDozZTY3MTY4Ny0zOTViLTQxZjUtYTMwZi1hNTg5MjFhNjliNzktMQ&limit=100>; rel="next"'
           content:
             application/json:
               schema:
@@ -159,7 +260,12 @@ paths:
                 items:
                   $ref: '#/components/schemas/BOMEntry'
         "400":
-          description: Bad Request (`after` missing or not a non-negative integer, or `limit` outside 1..1000)
+          description: >-
+            Bad Request: `after` missing (when `cursor` is absent) or not a non-negative
+            integer; `limit` outside 1..1000; `cursor` without `limit`; `cursor` combined
+            with `after`; or a malformed `cursor` (not base64url, wrong version tag,
+            missing fields, non-numeric or negative timestamp, empty key, empty value,
+            or otherwise not in the canonical form the service issues).
           content:
             application/problem+json:
               schema:
