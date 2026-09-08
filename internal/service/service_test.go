@@ -78,7 +78,7 @@ func TestSearch_Success(t *testing.T) {
 	svc, err := service.New(st, service.Config{CheckOnFetch: false})
 	require.NoError(t, err)
 
-	res, err := svc.Search(context.Background(), now.Unix()-1, 0)
+	res, err := searchEntries(svc, now.Unix()-1, 0)
 	require.NoError(t, err)
 	require.Len(t, res, 2)
 	require.Equal(t, "urn:uuid:1", res[0].SerialNumber)
@@ -119,7 +119,7 @@ func TestSearch_LegacyHeadNotFoundSkipsObject(t *testing.T) {
 	svc, err := service.New(st, service.Config{})
 	require.NoError(t, err)
 
-	res, err := svc.Search(context.Background(), now.Unix()-1, 0)
+	res, err := searchEntries(svc, now.Unix()-1, 0)
 	require.NoError(t, err)
 	require.Len(t, res, 1)
 	require.Equal(t, "urn:uuid:2", res[0].SerialNumber)
@@ -143,7 +143,7 @@ func TestSearch_LegacyHeadErrorFailsCall(t *testing.T) {
 	svc, err := service.New(st, service.Config{})
 	require.NoError(t, err)
 
-	_, err = svc.Search(context.Background(), now.Unix()-1, 0)
+	_, err = searchEntries(svc, now.Unix()-1, 0)
 	require.Error(t, err)
 }
 
@@ -168,7 +168,7 @@ func TestSearch_ListErrorFailsCall(t *testing.T) {
 			svc, err := service.New(st, service.Config{})
 			require.NoError(t, err)
 
-			_, err = svc.Search(context.Background(), 0, tc.limit)
+			_, err = searchEntries(svc, 0, tc.limit)
 			require.Error(t, err)
 		})
 	}
@@ -188,7 +188,7 @@ func TestSearch_BadKey(t *testing.T) {
 	svc, err := service.New(st, service.Config{CheckOnFetch: false})
 	require.NoError(t, err)
 
-	_, err = svc.Search(context.Background(), now.Unix()-1, 0)
+	_, err = searchEntries(svc, now.Unix()-1, 0)
 	require.Error(t, err)
 }
 
@@ -322,7 +322,7 @@ func TestSearch_LegacyEntryJSONIsByteCompatible(t *testing.T) {
 	svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
 	require.NoError(t, err)
 
-	res, err := svc.Search(context.Background(), when.Unix()-1, 0)
+	res, err := searchEntries(svc, when.Unix()-1, 0)
 	require.NoError(t, err)
 
 	var buf bytes.Buffer
@@ -360,7 +360,7 @@ func TestSearch_LegacyMissingStatsIsSkipped(t *testing.T) {
 	svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
 	require.NoError(t, err)
 
-	res, err := svc.Search(context.Background(), when.Unix()-1, 0)
+	res, err := searchEntries(svc, when.Unix()-1, 0)
 	require.NoError(t, err)
 	require.Len(t, res, 1, "the object without statistics is skipped, the other one is returned")
 	require.Equal(t, "urn:uuid:2", res[0].SerialNumber)
@@ -390,7 +390,7 @@ func TestSearch_LegacyInvalidStatsFailsCall(t *testing.T) {
 	svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
 	require.NoError(t, err)
 
-	_, err = svc.Search(context.Background(), when.Unix()-1, 0)
+	_, err = searchEntries(svc, when.Unix()-1, 0)
 	require.EqualError(t, err, "unmarshaling json failed")
 }
 
@@ -414,7 +414,7 @@ func TestSearch_LegacyCreatedAtFallsBackToListingClock(t *testing.T) {
 	svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3Mock, nil), service.Config{})
 	require.NoError(t, err)
 
-	res, err := svc.Search(context.Background(), when.Unix()-1, 0)
+	res, err := searchEntries(svc, when.Unix()-1, 0)
 	require.NoError(t, err)
 	require.Len(t, res, 1)
 	require.Equal(t, "2024-01-01T12:00:00Z", res[0].Timestamp)

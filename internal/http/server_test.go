@@ -212,6 +212,14 @@ func TestCORSHeadersOnSimpleRequest(t *testing.T) {
 			require.Equal(t, http.StatusOK, rec.Code)
 			require.Equal(t, tt.wantAllowOrigin, rec.Header().Get("Access-Control-Allow-Origin"))
 			require.Equal(t, tt.wantVary, rec.Header().Get("Vary"))
+			// A browser only lets the page read the Link header (the paged search's
+			// next-page cursor) when it is listed; without it a browser client would
+			// see every page as the last one.
+			wantExpose := ""
+			if tt.wantAllowOrigin != "" {
+				wantExpose = "Link"
+			}
+			require.Equal(t, wantExpose, rec.Header().Get("Access-Control-Expose-Headers"))
 		})
 	}
 }

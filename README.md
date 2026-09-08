@@ -23,7 +23,7 @@ Please note that HTTP API Paths have an additional default prefix `/api`. You ca
 | Path | HTTP Method | Required Params | Optional Params | Description |
 |:-----|:------------|:----------------|:----------------|:------------|
 | `/v1/bom`       | `POST` | Contents of BOM in request body and `Content-Type` header set | | Uploads the supplied BOM to the repository |
-| `/v1/bom`       | `GET`  | query parameter `after` | query parameter `limit` | Retrieves a list of BOM serial numbers and versions created after the `after` timestamp; with `limit`, one page at a time |
+| `/v1/bom`       | `GET`  | query parameter `after` or `cursor` | query parameter `limit` (required with `cursor`) | Retrieves a list of BOM serial numbers and versions created after the `after` timestamp; with `limit`, one page at a time, continued through the `cursor` in the `Link` header |
 | `/v1/bom/{urn}` | `GET`  | | query parameter `version` | If optional query parameter `version` is not supplied, retrieves the latest version of the BOM from repository |
 | `/v1/bom/{urn}/versions` | `GET` | | | List all available versions of a BOM identified by its URN |
 
@@ -70,44 +70,77 @@ This feature is still a work in progress, and both the format and the details re
 
 ### GET /v1/bom (Search)
 
-The search operation requires a single query parameter: `after`, whose value must be a Unix timestamp (seconds).
-The endpoint responds with a list of entries — one per stored document version, `original` included — created strictly after the specified timestamp.
+The search operation requires exactly one of two query parameters: `after`, whose value must be a Unix timestamp (seconds), or `cursor`, an opaque continuation token taken from the previous page's `Link` header (`cursor` also requires `limit`; see below).
+The endpoint responds with a list of entries — one per stored document version, `original` included — created strictly after the specified timestamp, or after the position the cursor encodes.
 Each entry carries `serialNumber`, `version` (a decimal integer or `original`), `created_at` (RFC 3339, second precision) and `cryptoStats`.
 
 #### Paging with `limit`
 
-Without `limit` the call behaves exactly as before: every matching entry, in object-store listing order; objects without statistics metadata are skipped, an object with unreadable statistics metadata fails the call, and no `warnings` field is ever emitted. Existing consumers see byte-identical responses.
+Without `limit` the call behaves exactly as before: every matching entry, in object-store listing order; objects without statistics metadata are skipped, an object with unreadable statistics metadata fails the call, no `warnings` field is ever emitted and no `Link` header is ever sent. Existing consumers see byte-identical responses.
 
-With `limit` (1..1000) the call returns one page:
+With `after` and `limit` (1..1000) the call opens a run and returns its first page:
 
-* entries are ordered by the store's `LastModified` at its native precision, then by object key;
+* entries are ordered by the store's `LastModified` at millisecond precision (the finest an S3 listing carries: whole seconds on AWS S3, milliseconds on MinIO), then by object key;
 * `created_at` is derived from the same listing timestamp that orders the page, so advancing `after` by it is always safe;
 * the comparison with `after` is done in whole seconds, matching the precision of `created_at`;
-* while more entries remain, a page holds at least `limit` entries and is then extended with every further entry sharing the last entry's second — a page never splits a second, so advancing `after` by whole seconds cannot skip anything. The page size is therefore `max(limit, entries in that second)`; `limit` bounds the `HEAD` fan-out only while seconds are sparse, and a burst of uploads stamped into one second comes back as one page (a hard limit arrives with the keyset cursor, issue #144);
-* objects whose key does not follow the `<urn>-<version>` naming (only possible for objects written to the bucket outside this API) are skipped with a warning in the service log: a key with no `-` at all also fails the legacy call, while a key whose version suffix is not a positive integer or `original` is returned as-is by the legacy call;
+* while more entries remain, a page holds at least `limit` entries and is then extended with every further entry sharing the last entry's second — a page never splits a second, so advancing `after` by whole seconds cannot skip anything. On this `after` page the limit is therefore soft: the page size is `max(limit, entries in that second)`, `limit` bounds the `HEAD` fan-out only while seconds are sparse, and a burst of uploads stamped into one second comes back as one page. Pages continued with `cursor` (below) hold exactly `limit` entries;
+* objects whose key does not follow the `<urn>-<version>` naming (only possible for objects written to the bucket outside this API) are skipped with a warning in the service log, as is an object that vanished between the listing and its `HEAD`; skipped objects do not count toward `limit`. A key with no `-` at all also fails the legacy call, while a key whose version suffix is not a positive integer or `original` is returned as-is by the legacy call;
 * a page shorter than `limit` (including an empty page) is the last one;
+* when the page stopped before the end of the listing — there are listed objects it has not examined — the response carries a `Link` header with `rel="next"` (below); the next page can still turn out empty. No `Link` means the page examined everything: the run is complete;
 * values above 1000 are rejected with `400` rather than clamped, so the termination rule above stays valid.
+
+#### Continuing with `cursor`
+
+When a page stopped before the end of the listing, the response carries an RFC 8288 `Link` header with `rel="next"`, for example:
+
+```text
+Link: <bom?cursor=djF8MTc4ODQ1MTIwMDAwMHx1cm46dXVpZDozZTY3MTY4Ny0zOTViLTQxZjUtYTMwZi1hNTg5MjFhNjliNzktMQ&limit=100>; rel="next"
+```
+
+The target is a relative-path reference to the same resource. Resolve it against the URL you just requested (RFC 3986 §5.2 — `URI.resolve` in Java, `URL.ResolveReference` in Go, `urljoin` in Python) and you get your own URL for this operation — with whatever prefix the deployment mounts the API under (`/api` by default), and with any prefix an ingress strips before the request reaches the service — plus the query string `cursor=<token>&limit=<N>`. It is never an absolute URL (scheme and host cannot be guessed behind proxies) and never a path-absolute one (that would repeat the service's own path, wrong exactly when a prefix was stripped). A client that builds URLs from a configured base can equally append the target's query string to its own `/v1/bom` URL — which is also the way through a proxy that rewrites the last path segment, since the reference relies on what the documented paths guarantee: your URL ends in the `bom` segment, without a trailing slash. The header is absent on the last page and is never sent by the unpaged call. The body stays a JSON array of the entries described above; there is no envelope.
+
+A `GET` with `cursor` and `limit` continues the run:
+
+* the page holds exactly `limit` entries while candidates remain, fewer (possibly zero) on the last page — the limit is hard, no second-completion;
+* candidates are the listed objects whose pair `(LastModified, key)` is strictly greater than the cursor's pair, ordered by `(LastModified asc, key asc)`. Comparison and ordering are at millisecond granularity (the finest precision an S3 listing carries: seconds on AWS S3, milliseconds on MinIO) with the object key as tie-break, so page boundaries are exact and unique;
+* the skip rules of the `after` page apply unchanged — a key that does not follow the `<urn>-<version>` naming, a version suffix that is not a positive integer or `original`, an object that vanished between the listing and its `HEAD` — and skipped candidates do not count toward `limit`;
+* `created_at` is derived from the listing `LastModified` (second precision), as on the `after` page;
+* `Link` is present when the page stopped before the end of the listing and absent when it examined everything — the run is complete. A `Link` can lead to an empty last page (the remaining listed objects were skipped or had vanished); a page shorter than `limit` is always the last page, but a page of exactly `limit` entries may be the last one too, so the absence of `Link`, not the page size, says the run is complete.
+
+The token is opaque: echo it back unchanged and never construct or modify it. The server encodes `v1|<LastModified in Unix milliseconds>|<key>` of the page's last entry — the listing's timestamp, not the `HEAD` one — as base64url without padding; the key comes last so a `|` inside a key cannot break parsing. A cursor is valid within a run only: do not persist it across runs or across a store migration; between runs use the watermark rule below.
+
+Requests are rejected with `400` (`application/problem+json`) when:
+
+* `cursor` is given without `limit`;
+* `cursor` and `after` are combined — a run opens with `after` and continues with `cursor`;
+* `cursor` is malformed: not base64url without padding, wrong version tag, missing fields, non-numeric or negative timestamp, empty key, empty value, or otherwise not in the canonical form the service issues (the token is a position, not a credential: it is not signed);
+* `limit` is outside 1..1000 (rejected, not clamped);
+* `cursor` is given more than once, or any query parameter cannot be decoded — invalid percent-encoding, or a `;` where `&` is expected (the parameter is named in the problem detail);
+* without `cursor`, `after` is missing or not a non-negative integer.
 
 Client protocol:
 
 ```text
 run_start = now()                      # your clock, or the Date header of the first response
-after = watermark                      # from the previous run
+page = GET /v1/bom?after={watermark}&limit=N
 loop:
-    page = GET /v1/bom?after={after}&limit=N
     process page                       # deduplicate on (serialNumber, version)
-    stop if len(page) < N
-    after = unix(page[-1].created_at)
+    stop unless the response has a Link header with rel="next"
+    page = GET <Link target resolved against the request URL>   # your /v1/bom URL with ?cursor=...&limit=N, same N
 watermark = unix(run_start) - overlap  # overlap >= clock skew + longest upload duration + 1 s; Core uses 60 s
 ```
 
-Within a run, advancing `after` by the last `created_at` is safe because a page never splits a second: every object that was listable when its page was built is yielded exactly once, and an object overwritten during the run (its `LastModified` moves) is yielded again under its new stamp — at-least-once, exactly-once for objects not modified during the run. Between runs the watermark must go back to the *start* of the previous run, not to the last `created_at`: an upload that completed while the run was already past its second — the still-open second, or a multipart upload, which S3 stamps with its **initiation** time — is only picked up by a run that starts behind it. The overlap therefore has to cover clock skew plus the longest upload you expect. Duplicates across runs are expected and deduplication is the consumer's job (Core deduplicates on `(serialNumber, version)` and already uses "job start − 60 s").
+A run that fails — any non-2xx response, including a `400` from a replica that does not know `cursor` yet during a rolling upgrade — must not advance the watermark; retry the whole run from `after`.
 
-Every call lists the whole bucket — an object store cannot filter by time — so paging bounds the per-call `HEAD` fan-out and response size, not the listing cost. The change-feed decision (keyset cursor next, tracked as #144; sequence and webhook rejected for the current epic) was ratified on [#138](https://github.com/OmniTrustILM/cbom-repository/issues/138#issuecomment-5540800814).
+The earlier loop — advancing `after` by the last entry's `created_at` and stopping on a page shorter than `limit` — keeps working unchanged for consumers that do not follow `Link`; following `Link` is the recommended protocol because pages are then exactly `limit` and boundaries are exact.
+
+Within a run, every object that was listable when its page was built is yielded exactly once (cursor boundaries are exact, and an `after` page never splits a second). An object overwritten during the run moves to a new `(LastModified, key)` position and is yielded again under its new stamp if that position is still ahead of the run — like any upload landing during the run; otherwise the next run's overlap picks it up. At-least-once overall, exactly-once for objects not modified during the run. Between runs the watermark must go back to the *start* of the previous run, not to the last `created_at` or to a cursor: an upload that completed while the run was already past its second — the still-open second, or a multipart upload, which S3 stamps with its **initiation** time — is only picked up by a run that starts behind it. The overlap therefore has to cover clock skew plus the longest upload you expect, and it stays on the client: the server has no overlap parameter. Duplicates across runs are expected and deduplication is the consumer's job (Core deduplicates on `(serialNumber, version)` and already uses "job start − 60 s").
+
+Every call lists the whole bucket — an object store cannot filter by time — so paging bounds the per-call `HEAD` fan-out and response size, not the listing cost. The change-feed decision (the keyset cursor, implemented here as #144; sequence and webhook rejected for the current epic) was ratified on [#138](https://github.com/OmniTrustILM/cbom-repository/issues/138#issuecomment-5540800814).
 
 #### Warnings (paged mode only)
 
-With `limit`, a stored object whose statistics metadata is missing or unreadable is no longer dropped from the listing. Its entry has `"cryptoStats": null` and a `warnings` array with one of:
+With `limit` — on the `after` page and on `cursor` pages alike — a stored object whose statistics metadata is missing or unreadable is no longer dropped from the listing. Its entry has `"cryptoStats": null` and a `warnings` array with one of:
 
 * `crypto-stats-missing` — the object carries no statistics metadata;
 * `crypto-stats-invalid` — the statistics metadata is not valid JSON.

@@ -1,12 +1,14 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 
@@ -154,41 +156,134 @@ func (s Server) URNVersions(w http.ResponseWriter, r *http.Request) {
 
 func (h Server) Search(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	after := r.URL.Query().Get("after")
 
-	if strings.TrimSpace(after) == "" {
-		badrequest(w, "Request validation failed, query parameter 'after' must not be empty.")
+	query, ok := parseQuery(w, r.URL.RawQuery)
+	if !ok {
 		return
 	}
-
-	i, err := strconv.ParseInt(after, 10, 64)
-	if err != nil || i < 0 {
-		// Zero is accepted: `after` is a watermark, and 0 (the epoch) legitimately
-		// means "everything". Only a negative value or a non-integer is rejected.
-		badrequest(w, "Request validation failed, query parameter 'after' must be a non-negative integer (unixtime).")
-		return
-	}
-
-	limit, ok := parseSearchLimit(w, r.URL.Query())
+	req, ok := parseSearchRequest(ctx, w, query)
 	if !ok {
 		return
 	}
 
-	slog.InfoContext(ctx, "Start.", slog.String("after", after), slog.Int("limit", limit))
+	slog.InfoContext(ctx, "Start.", searchPosition(req), slog.Int("limit", req.Limit))
 
-	resp, err := h.service.Search(ctx, i, limit)
+	page, err := h.service.Search(ctx, req)
 	if err != nil {
 		internal(w, fmt.Sprintf("Failed to get the requested BOM: %s.", err))
 		return
 	}
 
+	if page.Next != nil {
+		w.Header().Set("Link", nextPageLink(*page.Next, req.Limit))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err = json.NewEncoder(w).Encode(resp); err != nil {
+	if err = json.NewEncoder(w).Encode(page.Entries); err != nil {
 		slog.ErrorContext(ctx, "`json.NewEncoder()` failed", slog.String("error", err.Error()))
 		return
 	}
-	slog.InfoContext(ctx, "Finished.", slog.Int("response-count", len(resp)))
+	slog.InfoContext(ctx, "Finished.", slog.Int("response-count", len(page.Entries)), slog.Bool("has-next", page.Next != nil))
+}
+
+// parseQuery decodes the query string of GET /v1/bom. r.URL.Query() would drop a
+// parameter whose percent-encoding is invalid and carry on — `cursor=%zz&limit=5` would
+// then be reported as a missing `after` — so the parameter that failed to decode is
+// named in a 400 instead.
+func parseQuery(w http.ResponseWriter, rawQuery string) (url.Values, bool) {
+	query, err := url.ParseQuery(rawQuery)
+	if err == nil {
+		return query, true
+	}
+	if name := undecodableParameter(rawQuery); name != "" {
+		badrequest(w, fmt.Sprintf("Request validation failed, query parameter '%s' could not be decoded: %s.", name, err))
+	} else {
+		badrequest(w, fmt.Sprintf("Request validation failed, the query string could not be decoded: %s.", err))
+	}
+	return nil, false
+}
+
+// undecodableParameter names the first query parameter url.ParseQuery refuses: the raw
+// key of the first `key=value` pair whose key or value is not valid percent-encoding, or
+// that carries the `;` separator ParseQuery rejects. Empty when every pair decodes.
+func undecodableParameter(rawQuery string) string {
+	for _, pair := range strings.Split(rawQuery, "&") {
+		key, value, _ := strings.Cut(pair, "=")
+		if strings.Contains(pair, ";") {
+			return key
+		}
+		if _, err := url.QueryUnescape(key); err != nil {
+			return key
+		}
+		if _, err := url.QueryUnescape(value); err != nil {
+			return key
+		}
+	}
+	return ""
+}
+
+// parseSearchRequest reads the query of GET /v1/bom into the mode it selects. A request
+// carrying `cursor` continues a run (parseCursorRequest); any other request needs
+// `after` — a non-negative Unix timestamp — and may carry `limit`. On a violation a 400
+// problem is written and ok is false.
+func parseSearchRequest(ctx context.Context, w http.ResponseWriter, query url.Values) (req service.SearchRequest, ok bool) {
+	if query.Has("cursor") {
+		return parseCursorRequest(ctx, w, query)
+	}
+
+	after := query.Get("after")
+	if strings.TrimSpace(after) == "" {
+		badrequest(w, "Request validation failed, query parameter 'after' must not be empty.")
+		return service.SearchRequest{}, false
+	}
+	i, err := strconv.ParseInt(after, 10, 64)
+	if err != nil || i < 0 {
+		// Zero is accepted: `after` is a watermark, and 0 (the epoch) legitimately
+		// means "everything". Only a negative value or a non-integer is rejected.
+		badrequest(w, "Request validation failed, query parameter 'after' must be a non-negative integer (unixtime).")
+		return service.SearchRequest{}, false
+	}
+
+	limit, ok := parseSearchLimit(w, query)
+	if !ok {
+		return service.SearchRequest{}, false
+	}
+	return service.SearchRequest{After: i, Limit: limit}, true
+}
+
+// parseCursorRequest reads a request that continues a run. `cursor` excludes `after` — a
+// run opens with `after` and continues with the cursor, never both — is given once, and
+// requires a valid `limit`; the token itself must be in the canonical form this service
+// issues (service.ParseCursor).
+// Checks run cheapest first, so a request that is wrong in several ways is told about
+// its shape before its token.
+func parseCursorRequest(ctx context.Context, w http.ResponseWriter, query url.Values) (req service.SearchRequest, ok bool) {
+	if query.Has("after") {
+		badrequest(w, "Request validation failed, query parameter 'cursor' cannot be combined with 'after': a run opens with 'after' and continues with the cursor from the Link header.")
+		return service.SearchRequest{}, false
+	}
+	if len(query["cursor"]) > 1 {
+		// url.Values would silently take the first; two positions in one request is a
+		// client bug worth reporting, not guessing about.
+		badrequest(w, "Request validation failed, query parameter 'cursor' must be given once.")
+		return service.SearchRequest{}, false
+	}
+	if !query.Has("limit") {
+		badrequest(w, "Request validation failed, query parameter 'cursor' requires 'limit'.")
+		return service.SearchRequest{}, false
+	}
+	limit, ok := parseSearchLimit(w, query)
+	if !ok {
+		return service.SearchRequest{}, false
+	}
+
+	cursor, err := service.ParseCursor(query.Get("cursor"))
+	if err != nil {
+		slog.DebugContext(ctx, "Rejecting a malformed cursor.", slog.String("error", err.Error()))
+		badrequest(w, "Request validation failed, query parameter 'cursor' is malformed; use the value from the Link header of the previous page unchanged.")
+		return service.SearchRequest{}, false
+	}
+	return service.SearchRequest{Cursor: &cursor, Limit: limit}, true
 }
 
 // parseSearchLimit reads the optional `limit` query parameter of GET /v1/bom. Absent
@@ -204,4 +299,31 @@ func parseSearchLimit(w http.ResponseWriter, query url.Values) (limit int, ok bo
 		return 0, false
 	}
 	return n, true
+}
+
+// searchPosition is where a search starts, for the request log: the cursor of a
+// continued page, otherwise the `after` watermark.
+func searchPosition(req service.SearchRequest) slog.Attr {
+	if req.Cursor != nil {
+		return slog.Any("cursor", *req.Cursor)
+	}
+	return slog.Int64("after", req.After)
+}
+
+// nextPageLink renders the Link header (RFC 8288) that carries the next page: a
+// relative-path reference to this same resource — `bom?cursor=<token>&limit=<N>` — with
+// rel="next". The client resolves it against the URL it just requested (RFC 3986 §5.2:
+// the last path segment is replaced, the query is the new one), which gives the right
+// URL whatever path the client reached this service by: with or without
+// APP_HTTP_PREFIX, and behind an ingress that strips a prefix this service never sees.
+// An absolute URL would need the scheme and host as the client sees them, which a
+// service behind a proxy cannot know; a path-absolute reference would repeat this
+// service's own path, which is wrong exactly when a prefix was stripped. The query is
+// built with url.Values so the token would be percent-encoded if it ever needed to be
+// (base64url never does).
+func nextPageLink(next service.Cursor, limit int) string {
+	query := url.Values{}
+	query.Set("cursor", next.String())
+	query.Set("limit", strconv.Itoa(limit))
+	return fmt.Sprintf("<%s?%s>; rel=\"next\"", path.Base(RouteBOM), query.Encode())
 }

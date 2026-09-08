@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,14 +16,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// compiledService is one Service whose schemas were compiled once for the whole package;
+// newSvc points it at each test's store. service.New spends its time compiling the
+// CycloneDX schemas, which no search test exercises.
+var compiledService = sync.OnceValues(func() (service.Service, error) {
+	return service.New(store.New(store.Config{Bucket: "bucket"}, nil, nil), service.Config{})
+})
+
 func newSvc(t *testing.T, s3 *fakeS3) service.Service {
 	t.Helper()
-	svc, err := service.New(store.New(store.Config{Bucket: "bucket"}, s3, nil), service.Config{})
+	svc, err := compiledService()
 	require.NoError(t, err)
-	return svc
+	return svc.WithStore(store.New(store.Config{Bucket: "bucket"}, s3, nil))
 }
 
 func entryID(e service.SearchRes) string { return e.SerialNumber + "-" + e.Version }
+
+// searchEntries runs one call in legacy (limit <= 0) or opening-page (after + limit)
+// mode and returns its entries — the shape the pre-cursor tests were written against.
+// The cursor of the page is exercised by search_cursor_test.go.
+func searchEntries(svc service.Service, after int64, limit int) ([]service.SearchRes, error) {
+	page, err := svc.Search(context.Background(), service.SearchRequest{After: after, Limit: limit})
+	return page.Entries, err
+}
 
 func createdAtUnix(t *testing.T, e service.SearchRes) int64 {
 	t.Helper()
@@ -40,7 +56,7 @@ func iterate(t *testing.T, svc service.Service, after int64, limit int) ([]servi
 	var all []service.SearchRes
 	var sizes []int
 	for {
-		page, err := svc.Search(context.Background(), after, limit)
+		page, err := searchEntries(svc, after, limit)
 		require.NoError(t, err)
 		sizes = append(sizes, len(page))
 		for i := 1; i < len(page); i++ {
@@ -98,12 +114,17 @@ func assertNoEntryAtOrBefore(t *testing.T, entries []service.SearchRes, ts int64
 
 // injectLateUploads returns a fakeS3.beforeListing hook that, for listings 2 through 5,
 // seeds three more objects landing between +30s and +44s of base — simulating uploads
-// that complete while a run is already in progress.
-func injectLateUploads(s3 *fakeS3, rng *rand.Rand, base time.Time) func(listing int) {
+// that complete while a run is already in progress. When landed is non-nil, it records
+// before which listing each of them landed.
+func injectLateUploads(s3 *fakeS3, rng *rand.Rand, base time.Time, landed map[string]int) func(listing int) {
 	return func(listing int) {
 		if listing > 1 && listing < 6 {
 			for j := 0; j < 3; j++ {
-				s3.putWithStats(fmt.Sprintf("urn:uuid:late-%02d-%d-1", listing, j), base.Add(time.Duration(30+rng.Intn(15))*time.Second))
+				key := fmt.Sprintf("urn:uuid:late-%02d-%d-1", listing, j)
+				if landed != nil {
+					landed[key] = listing
+				}
+				s3.putWithStats(key, base.Add(time.Duration(30+rng.Intn(15))*time.Second))
 			}
 		}
 	}
@@ -249,7 +270,7 @@ func TestSearch_Paged_AtLeastOnceRandomised(t *testing.T) {
 				s3.putWithStats(fmt.Sprintf("urn:uuid:obj-%03d-1", i), base.Add(time.Duration(rng.Intn(40))*time.Second+time.Duration(rng.Intn(1000))*time.Millisecond))
 			}
 			limit := 1 + rng.Intn(12)
-			s3.beforeListing = injectLateUploads(s3, rng, base)
+			s3.beforeListing = injectLateUploads(s3, rng, base, nil)
 			svc := newSvc(t, s3)
 
 			run1, _ := iterate(t, svc, base.Unix()-1, limit)
@@ -279,12 +300,12 @@ func TestSearch_Paged_SecondGranularityBoundary(t *testing.T) {
 	s3.putWithStats("urn:uuid:next-second-1", base.Add(1*time.Second))
 	svc := newSvc(t, s3)
 
-	paged, err := svc.Search(context.Background(), base.Unix(), 10)
+	paged, err := searchEntries(svc, base.Unix(), 10)
 	require.NoError(t, err)
 	require.Len(t, paged, 1)
 	require.Equal(t, "urn:uuid:next-second", paged[0].SerialNumber)
 
-	legacy, err := svc.Search(context.Background(), base.Unix(), 0)
+	legacy, err := searchEntries(svc, base.Unix(), 0)
 	require.NoError(t, err)
 	require.Len(t, legacy, 2, "legacy mode keeps the nanosecond compare")
 }
@@ -298,7 +319,7 @@ func TestSearch_Paged_SortedByLastModifiedThenKey(t *testing.T) {
 	s3.putWithStats("urn:uuid:d-original", base.Add(1*time.Second))
 	svc := newSvc(t, s3)
 
-	res, err := svc.Search(context.Background(), base.Unix(), 10)
+	res, err := searchEntries(svc, base.Unix(), 10)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(res))
 	for _, e := range res {
@@ -320,7 +341,7 @@ func TestSearch_Paged_SkipsVanishedAndForeignKeys(t *testing.T) {
 	s3.headErr["urn:uuid:gone-1"] = &types.NotFound{}
 	svc := newSvc(t, s3)
 
-	res, err := svc.Search(context.Background(), base.Unix(), 2)
+	res, err := searchEntries(svc, base.Unix(), 2)
 	require.NoError(t, err)
 	require.Len(t, res, 2, "skipped objects do not count toward the limit")
 	require.Equal(t, []string{"urn:uuid:a-1", "urn:uuid:b-1"}, []string{entryID(res[0]), entryID(res[1])})
@@ -344,7 +365,7 @@ func TestSearch_Paged_SkipInsideBoundarySecondDoesNotClobberBoundary(t *testing.
 	s3.headErr["urn:uuid:gone-1"] = &types.NotFound{}
 	svc := newSvc(t, s3)
 
-	res, err := svc.Search(context.Background(), base.Unix(), 2)
+	res, err := searchEntries(svc, base.Unix(), 2)
 	require.NoError(t, err)
 	require.Len(t, res, 2, "the vanished object and the foreign key inside the boundary second are skipped, not counted, and do not reopen the page into the +6s second")
 	require.Equal(t, []string{"urn:uuid:a-1", "urn:uuid:b-1"}, []string{entryID(res[0]), entryID(res[1])})
@@ -358,7 +379,7 @@ func TestSearch_Paged_HeadErrorFailsCall(t *testing.T) {
 	s3.headErr["urn:uuid:a-1"] = errors.New("boom")
 	svc := newSvc(t, s3)
 
-	_, err := svc.Search(context.Background(), base.Unix(), 5)
+	_, err := searchEntries(svc, base.Unix(), 5)
 	require.Error(t, err)
 }
 
@@ -367,7 +388,7 @@ func TestSearch_Paged_EmptyAndExactLimit(t *testing.T) {
 	s3 := newFakeS3(1000)
 	svc := newSvc(t, s3)
 
-	res, err := svc.Search(context.Background(), base.Unix(), 3)
+	res, err := searchEntries(svc, base.Unix(), 3)
 	require.NoError(t, err)
 	require.Equal(t, []service.SearchRes{}, res, "empty, non-nil slice encodes as []")
 
@@ -375,7 +396,7 @@ func TestSearch_Paged_EmptyAndExactLimit(t *testing.T) {
 	s3.putWithStats("urn:uuid:b-1", base.Add(2*time.Second))
 	s3.putWithStats("urn:uuid:c-1", base.Add(3*time.Second))
 	s3.putWithStats("urn:uuid:d-1", base.Add(4*time.Second))
-	res, err = svc.Search(context.Background(), base.Unix(), 3)
+	res, err = searchEntries(svc, base.Unix(), 3)
 	require.NoError(t, err)
 	require.Len(t, res, 3, "limit reached exactly at a second boundary → no overshoot")
 	require.Equal(t, "urn:uuid:c", res[2].SerialNumber)
@@ -456,7 +477,7 @@ func TestSearch_Paged_StatsWarnings(t *testing.T) {
 			s3.put("urn:uuid:a-1", base.Add(1*time.Second), tc.metadata)
 			svc := newSvc(t, s3)
 
-			res, err := svc.Search(context.Background(), base.Unix(), 10)
+			res, err := searchEntries(svc, base.Unix(), 10)
 			require.NoError(t, err)
 			require.Len(t, res, 1, "an object is never dropped from a page because of its statistics")
 			require.Equal(t, tc.wantWarnings, res[0].Warnings)
@@ -479,7 +500,7 @@ func TestSearch_Paged_UnreadableStatsDoNotAffectOtherEntries(t *testing.T) {
 	s3.putWithStats("urn:uuid:b-1", base.Add(2*time.Second))
 	svc := newSvc(t, s3)
 
-	res, err := svc.Search(context.Background(), base.Unix(), 10)
+	res, err := searchEntries(svc, base.Unix(), 10)
 	require.NoError(t, err)
 	require.Len(t, res, 2)
 	require.Nil(t, res[0].CryptoStats)
@@ -502,7 +523,7 @@ func TestSearch_Paged_SkipsInvalidVersionSuffix(t *testing.T) {
 	s3.putWithStats("urn:uuid:b-original", base.Add(5*time.Second))
 	svc := newSvc(t, s3)
 
-	paged, err := svc.Search(context.Background(), base.Unix(), 10)
+	paged, err := searchEntries(svc, base.Unix(), 10)
 	require.NoError(t, err)
 	ids := make([]string, 0, len(paged))
 	for _, e := range paged {
@@ -510,7 +531,7 @@ func TestSearch_Paged_SkipsInvalidVersionSuffix(t *testing.T) {
 	}
 	require.Equal(t, []string{"urn:uuid:a-1", "urn:uuid:b-original"}, ids)
 
-	legacy, err := svc.Search(context.Background(), base.Unix(), 0)
+	legacy, err := searchEntries(svc, base.Unix(), 0)
 	require.NoError(t, err)
 	require.Len(t, legacy, 5, "legacy mode returns every key with a '-', whatever its suffix")
 }

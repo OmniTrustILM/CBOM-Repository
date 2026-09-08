@@ -52,13 +52,18 @@ const (
 
 // MaxSearchLimit is the largest page size GET /v1/bom accepts for `limit`.
 //
-// `limit` is a soft floor, not a ceiling: the never-split-a-second rule (see
-// searchPaged) keeps a page growing until the second that filled it is exhausted, so a
-// page holds at least `limit` entries and every remaining entry of its last second —
-// its size is max(limit, entries in that second). Each entry costs one HEAD request, so
-// `limit` bounds a call's HEAD fan-out only when seconds are sparse; one dense second
-// can push a page (and its fan-out) well past the cap, which searchPaged logs. A hard
-// per-page bound needs the keyset cursor tracked in issue #144.
+// On the opening page of a run (`after` + `limit`) the limit is a soft floor, not a
+// ceiling: the never-split-a-second rule (see searchPaged) keeps a page growing until
+// the second that filled it is exhausted, so a page holds at least `limit` entries and
+// every remaining entry of its last second — its size is max(limit, entries in that
+// second). Each entry costs one HEAD request, so on that page `limit` bounds the HEAD
+// fan-out only when seconds are sparse; one dense second can push it (and its fan-out)
+// well past the cap, which searchPaged logs. The soft limit stays on the opening page
+// because a consumer that advances `after` by created_at without following Link needs
+// the whole second to be lossless; #144 keeps that protocol byte for byte. A continued
+// page (`cursor` + `limit`, see searchCursor) holds exactly `limit` entries while
+// candidates remain: the cursor's key tie-break makes the boundary exact, so there is
+// no second to complete.
 //
 // The cap does not bound the LIST side either: store.Search still lists the whole bucket
 // on every call regardless of `limit`. Requests above the cap are rejected rather than
@@ -221,31 +226,70 @@ type SearchRes struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
-// Search retrieves BOMs with a last modified timestamp greater than the specified value
-// and enriches each result with cryptographic asset statistics extracted from object
-// metadata.
+// SearchRequest selects one of the three modes of GET /v1/bom:
 //
-// limit <= 0 selects the legacy, unpaged behaviour: every matching object, in listing
-// order, LastModified compared at full precision, statistics that cannot be read
-// skipping the object or failing the call — see searchLegacy. limit > 0 selects paged
-// mode, where such an object stays visible with a warning code instead; see searchPaged.
+//   - Limit <= 0 (Cursor must be nil): the legacy, unpaged call — every object modified
+//     after After, in listing order; see searchLegacy.
+//   - Limit > 0, Cursor nil: the opening page of a run — the objects whose LastModified
+//     second is after After, soft limit; see searchPaged.
+//   - Limit > 0, Cursor set: a continued page — the objects strictly after the cursor's
+//     (LastModified, key) position, hard limit; see searchCursor. After is ignored.
+type SearchRequest struct {
+	// After is the watermark, a Unix timestamp in seconds: only objects modified after
+	// it are returned. Ignored when Cursor is set.
+	After int64
+	// Cursor continues a run from the position of the previous page's last entry. It
+	// requires Limit > 0.
+	Cursor *Cursor
+	// Limit is the page size (the handler enforces 1..MaxSearchLimit), or <= 0 for the
+	// legacy, unpaged call.
+	Limit int
+}
+
+// SearchPage is one response of GET /v1/bom.
+type SearchPage struct {
+	// Entries is the JSON array body; never nil when the error is nil.
+	Entries []SearchRes
+	// Next is the cursor of the following page — the position of this page's last
+	// entry. It is set exactly when unexamined candidates remain after this page (the
+	// handler renders it as the Link header), nil on the last page, and always nil in
+	// legacy mode.
+	Next *Cursor
+}
+
+// Search serves GET /v1/bom in the mode req selects (see SearchRequest), enriching each
+// entry with the cryptographic asset statistics read from the object's metadata.
 //
 // Parameters:
 //   - ctx: Context for cancellation, deadlines, and additional slog fields.
-//   - ts: Unix timestamp (seconds since epoch); only BOMs modified after this time are returned
-//   - limit: page size for paged mode (the handler enforces 1..MaxSearchLimit), or <= 0 for legacy mode
+//   - req: the mode and its parameters
 //
 // Returns:
-//   - []SearchRes: Slice of search results containing serial number, version, timestamp, and crypto statistics
-//   - error: Non-nil if the store query fails or, in legacy mode, a key does not follow
-//     the naming invariant or its statistics are not valid JSON
-func (s Service) Search(ctx context.Context, ts int64, limit int) ([]SearchRes, error) {
-	ctx = log.ContextAttrs(ctx, slog.Int64("timestamp", ts), slog.Int("limit", limit))
-	slog.DebugContext(ctx, "Calling `store.Search()`.")
+//   - SearchPage: the entries and, in the paged modes, the cursor of the next page
+//   - error: Non-nil if the store query fails, if req is inconsistent (a Cursor without
+//     a Limit — a programming error at the call site, not client input, so not
+//     ErrValidation) or, in legacy mode, if a key does not follow the naming invariant
+//     or its statistics are not valid JSON
+func (s Service) Search(ctx context.Context, req SearchRequest) (SearchPage, error) {
+	if req.Cursor != nil && req.Limit <= 0 {
+		return SearchPage{}, errors.New("a cursor requires a limit")
+	}
+	ctx = log.ContextAttrs(ctx, slog.Int("limit", req.Limit))
 
+	// ts is the listing floor handed to store.Search — the second the run continues
+	// from, whichever way it was given; logged as such so a short continued page can be
+	// read against the floor that produced it.
+	ts := req.After
+	if req.Cursor != nil {
+		ts = req.Cursor.listFrom()
+		ctx = log.ContextAttrs(ctx, slog.Any("cursor", *req.Cursor))
+	}
+	ctx = log.ContextAttrs(ctx, slog.Int64("timestamp", ts))
+
+	slog.DebugContext(ctx, "Calling `store.Search()`.")
 	r, err := s.store.Search(ctx, ts)
 	if err != nil {
-		return nil, err
+		return SearchPage{}, err
 	}
 
 	slog.DebugContext(ctx, "`store.Search()` finished.",
@@ -253,10 +297,15 @@ func (s Service) Search(ctx context.Context, ts int64, limit int) ([]SearchRes, 
 		slog.String("value", strings.Join(objectKeys(r), ",")),
 	)
 
-	if limit <= 0 {
-		return s.searchLegacy(ctx, r)
+	switch {
+	case req.Cursor != nil:
+		return s.searchCursor(ctx, r, *req.Cursor, req.Limit)
+	case req.Limit > 0:
+		return s.searchPaged(ctx, r, req.After, req.Limit)
+	default:
+		entries, err := s.searchLegacy(ctx, r)
+		return SearchPage{Entries: entries}, err
 	}
-	return s.searchPaged(ctx, r, ts, limit)
 }
 
 // searchLegacy is the unpaged search: every listed object, in listing order, one HEAD
@@ -343,31 +392,49 @@ func legacyCreatedAt(head store.HeadObject, obj store.ObjectInfo) string {
 	return head.LastModified.Format(time.RFC3339)
 }
 
-// pagedCandidates selects and orders the objects searchPaged consumes:
-//
-//  1. Only objects whose LastModified *second* is after ts are candidates — the same
-//     granularity as created_at, so MinIO's sub-second values cannot leak an object of
-//     the `after` second into the next page.
-//  2. Candidates are ordered by (LastModified, key); ties are impossible.
+// pagedCandidates selects and orders the objects the opening page of a run
+// (searchPaged) consumes: only objects whose LastModified *second* is after ts — the
+// same granularity as created_at, so MinIO's sub-second values cannot leak an object of
+// the `after` second into the next page.
 func pagedCandidates(objects []store.ObjectInfo, ts int64) []store.ObjectInfo {
-	candidates := make([]store.ObjectInfo, 0, len(objects))
-	for _, obj := range objects {
-		if obj.LastModified.Unix() > ts {
-			candidates = append(candidates, obj)
-		}
-	}
-	slices.SortFunc(candidates, func(a, b store.ObjectInfo) int {
-		if c := a.LastModified.Compare(b.LastModified); c != 0 {
-			return c
-		}
-		return strings.Compare(a.Key, b.Key)
-	})
-	return candidates
+	return selectCandidates(objects, func(obj store.ObjectInfo) bool { return obj.LastModified.Unix() > ts })
 }
 
-// searchPaged returns one page of the feed. The rules exist so that a consumer can
+// cursorCandidates selects and orders the objects a continued page (searchCursor)
+// consumes: those whose (LastModified, key) sorts strictly after the cursor
+// (Cursor.precedes). The cursor's own object is excluded, so following cursors yields
+// every object exactly once within a run.
+func cursorCandidates(objects []store.ObjectInfo, c Cursor) []store.ObjectInfo {
+	return selectCandidates(objects, c.precedes)
+}
+
+// selectCandidates keeps the objects `keep` accepts and orders them by their position
+// (Cursor.compare): LastModified at millisecond precision — the finest an S3 listing
+// carries, and the precision a cursor records — then key. Keys are unique, so the order
+// is total. Sorting and cursor filtering share the one comparison on purpose: if the
+// order pages are cut in and the order a cursor resumes in differed, an object could be
+// yielded twice, or never, at the seam between two pages.
+func selectCandidates(objects []store.ObjectInfo, keep func(store.ObjectInfo) bool) []store.ObjectInfo {
+	res := make([]store.ObjectInfo, 0, len(objects))
+	for _, obj := range objects {
+		if keep(obj) {
+			res = append(res, obj)
+		}
+	}
+	slices.SortFunc(res, func(a, b store.ObjectInfo) int { return position(a).compare(position(b)) })
+	return res
+}
+
+// nextCursor is the cursor a page hands out when obj is its last yielded entry.
+func nextCursor(obj store.ObjectInfo) *Cursor {
+	c := position(obj)
+	return &c
+}
+
+// searchPaged returns the opening page of a run. The rules exist so that a consumer can
 // advance `after` to the last entry's created_at (whole seconds) without skipping
-// entries, on AWS S3 and MinIO alike:
+// entries, on AWS S3 and MinIO alike — and so that the cursor the page hands out
+// continues exactly where the page stopped:
 //
 //  1. Candidates come from pagedCandidates: second-granularity filter on ts, ordered
 //     by (LastModified, key).
@@ -376,63 +443,105 @@ func pagedCandidates(objects []store.ObjectInfo, ts int64) []store.ObjectInfo {
 //     a second"). `limit` is therefore a floor, not a ceiling (see MaxSearchLimit); a
 //     page that outgrows twice `limit` is logged, since a second dense enough to do
 //     that also multiplies the call's HEAD fan-out.
-//  3. Candidates that are skipped do not count toward `limit` and never fail the call:
-//     an object that vanished between LIST and HEAD, a key that does not follow the
-//     naming invariant, and a key whose version suffix is not one this service writes
-//     (see ValidVersion) — the last two are logged as warnings. Legacy mode still
-//     returns keys with a foreign version suffix; only paged consumers, which fetch by
-//     (serialNumber, version), are protected from an entry they could not fetch.
-//  4. A page shorter than `limit` is the last one. Everything else (HEAD errors,
-//     statistics warnings) behaves as in pagedEntry.
-//  5. created_at is overwritten with the LIST LastModified (obj.LastModified) that
-//     decided the boundary above, instead of the HEAD LastModified pagedEntry set it
-//     to. The boundary and created_at must come from the same clock: if HEAD reports a
-//     different second than LIST (an unguarded overwrite landing between LIST and HEAD
-//     — e.g. via uploadCaseSNValidVersionInvalid — or a store whose HTTP-date rounding
-//     differs from its listing precision), a consumer advancing `after` to the last
-//     created_at must never be able to outrun the boundary the next page is filtered
-//     against.
-func (s Service) searchPaged(ctx context.Context, objects []store.ObjectInfo, ts int64, limit int) ([]SearchRes, error) {
-	res := []SearchRes{}
+//  3. Candidates that are skipped do not count toward `limit` and never fail the call;
+//     see pagedCandidateEntry.
+//  4. A page shorter than `limit` is the last one. Next is set exactly when the walk
+//     stopped in front of an unexamined candidate; it is the position of the last
+//     yielded entry, so a continued page (searchCursor) resumes right after it. A
+//     candidate this page examined and skipped between that entry and the stop is
+//     re-examined by the next page and skipped again — never yielded, never counted —
+//     so nothing is lost or repeated.
+func (s Service) searchPaged(ctx context.Context, objects []store.ObjectInfo, ts int64, limit int) (SearchPage, error) {
+	page := SearchPage{Entries: []SearchRes{}}
 	var pageFull bool
-	var boundary int64 // second of the entry that filled the page; meaningful only while pageFull
+	var boundary int64        // second of the entry that filled the page; meaningful only while pageFull
+	var last store.ObjectInfo // the last yielded candidate; set once the page is non-empty
 	for _, obj := range pagedCandidates(objects, ts) {
 		second := obj.LastModified.Unix()
 		if pageFull && second != boundary {
+			page.Next = nextCursor(last) // pageFull implies a yielded entry, so last is set
 			break
 		}
 
-		serialNumber, version, ok := pagedKey(ctx, obj.Key)
-		if !ok {
-			continue
-		}
-
-		entry, found, err := s.pagedEntry(ctx, obj.Key, serialNumber, version)
+		entry, found, err := s.pagedCandidateEntry(ctx, obj)
 		if err != nil {
-			return nil, err
+			return SearchPage{}, err
 		}
 		if !found {
 			continue
 		}
-		// The boundary above is computed from the LIST LastModified (obj.LastModified);
-		// created_at must come from that same clock, not from pagedEntry's HEAD
-		// LastModified, so a consumer advancing `after` by created_at can never outrun
-		// the boundary the next page is filtered against.
-		entry.Timestamp = obj.LastModified.UTC().Format(time.RFC3339)
-		res = append(res, entry)
-		if len(res) >= limit {
+		page.Entries = append(page.Entries, entry)
+		last = obj
+		if len(page.Entries) >= limit {
 			pageFull = true
 			boundary = second
 		}
 	}
-	warnDensePage(ctx, limit, len(res), boundary)
-	return res, nil
+	warnDensePage(ctx, limit, len(page.Entries), boundary)
+	return page, nil
 }
 
-// warnDensePage logs a page the never-split-a-second rule grew past twice `limit`. Such
-// a page also cost more than twice `limit` HEAD requests, so the log names the second
-// responsible: a single second dense enough to do this is the signal that this endpoint
-// needs the keyset cursor of issue #144, not a smaller `limit`.
+// searchCursor returns a continued page of a run: the objects strictly after the cursor
+// (cursorCandidates), in (LastModified, key) order, up to exactly `limit` entries. The
+// key tie-break makes the boundary exact, so there is no second to complete and the
+// limit is hard. Skipped candidates do not count and never fail the call (see
+// pagedCandidateEntry). Next is set exactly when the page filled with unexamined
+// candidates still ahead; it is the position of the last yielded entry.
+func (s Service) searchCursor(ctx context.Context, objects []store.ObjectInfo, c Cursor, limit int) (SearchPage, error) {
+	page := SearchPage{Entries: []SearchRes{}}
+	candidates := cursorCandidates(objects, c)
+	for i, obj := range candidates {
+		entry, found, err := s.pagedCandidateEntry(ctx, obj)
+		if err != nil {
+			return SearchPage{}, err
+		}
+		if !found {
+			continue
+		}
+		page.Entries = append(page.Entries, entry)
+		if len(page.Entries) == limit {
+			if i+1 < len(candidates) {
+				page.Next = nextCursor(obj)
+			}
+			break
+		}
+	}
+	return page, nil
+}
+
+// pagedCandidateEntry turns one candidate into its entry, for both paged modes. found
+// is false for a candidate the page skips — without counting it toward the limit and
+// without failing the call: a key that does not follow the naming invariant, a key
+// whose version suffix is not one this service writes (both logged by pagedKey), and an
+// object that vanished between LIST and HEAD (pagedEntry). Any other HEAD error fails
+// the call.
+//
+// created_at is overwritten with the LIST LastModified (obj.LastModified) that ordered
+// the candidate, instead of the HEAD LastModified pagedEntry set it to. The page
+// boundary, the cursor and created_at must all come from the same clock: if HEAD
+// reports a different second than LIST (an unguarded overwrite landing between LIST and
+// HEAD — e.g. via uploadCaseSNValidVersionInvalid — or a store whose HTTP-date rounding
+// differs from its listing precision), a consumer advancing `after` to the last
+// created_at must never be able to outrun the boundary the next page is filtered
+// against.
+func (s Service) pagedCandidateEntry(ctx context.Context, obj store.ObjectInfo) (SearchRes, bool, error) {
+	serialNumber, version, ok := pagedKey(ctx, obj.Key)
+	if !ok {
+		return SearchRes{}, false, nil
+	}
+	entry, found, err := s.pagedEntry(ctx, obj.Key, serialNumber, version)
+	if err != nil || !found {
+		return SearchRes{}, false, err
+	}
+	entry.Timestamp = obj.LastModified.UTC().Format(time.RFC3339)
+	return entry, true, nil
+}
+
+// warnDensePage logs an opening page the never-split-a-second rule grew past twice
+// `limit`. Such a page also cost more than twice `limit` HEAD requests, so the log names
+// the second responsible. Only the opening page of a run can do this: a continued page
+// (searchCursor) holds exactly `limit`, so a run that opens in a dense second pays the
+// price once, on its first page, and a smaller `limit` would not change that.
 func warnDensePage(ctx context.Context, limit, size int, boundary int64) {
 	if size <= 2*limit {
 		return
