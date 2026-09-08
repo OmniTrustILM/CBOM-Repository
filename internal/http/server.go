@@ -179,6 +179,9 @@ func maxBodySizeMiddleware(maxBytes int64) func(http.Handler) http.Handler {
 const (
 	corsAllowedMethods = "GET, POST, OPTIONS"
 	corsAllowedHeaders = "Content-Type"
+	// corsExposedHeaders lets a browser client read the paged search's next-page
+	// cursor (the Link header); without it every page would look like the last one.
+	corsExposedHeaders = "Link"
 	corsMaxAge         = "600"
 )
 
@@ -229,6 +232,7 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", corsAllowedMethods)
 				w.Header().Set("Access-Control-Allow-Headers", corsAllowedHeaders)
+				w.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 				w.Header().Set("Access-Control-Max-Age", corsMaxAge)
 			}
 
