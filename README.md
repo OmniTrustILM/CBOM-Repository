@@ -115,6 +115,7 @@ Requests are rejected with `400` (`application/problem+json`) when:
 * `cursor` and `after` are combined — a run opens with `after` and continues with `cursor`;
 * `cursor` is malformed: not base64url without padding, wrong version tag, missing fields, non-numeric or negative timestamp, empty key, empty value, or otherwise not in the canonical form the service issues (the token is a position, not a credential: it is not signed);
 * `limit` is outside 1..1000 (rejected, not clamped);
+* `cursor` is given more than once, or any query parameter cannot be decoded — invalid percent-encoding, or a `;` where `&` is expected (the parameter is named in the problem detail);
 * without `cursor`, `after` is missing or not a non-negative integer.
 
 Client protocol:

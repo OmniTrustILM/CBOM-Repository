@@ -276,13 +276,15 @@ func (s Service) Search(ctx context.Context, req SearchRequest) (SearchPage, err
 	}
 	ctx = log.ContextAttrs(ctx, slog.Int("limit", req.Limit))
 
+	// ts is the listing floor handed to store.Search — the second the run continues
+	// from, whichever way it was given; logged as such so a short continued page can be
+	// read against the floor that produced it.
 	ts := req.After
 	if req.Cursor != nil {
 		ts = req.Cursor.listFrom()
 		ctx = log.ContextAttrs(ctx, slog.Any("cursor", *req.Cursor))
-	} else {
-		ctx = log.ContextAttrs(ctx, slog.Int64("timestamp", ts))
 	}
+	ctx = log.ContextAttrs(ctx, slog.Int64("timestamp", ts))
 
 	slog.DebugContext(ctx, "Calling `store.Search()`.")
 	r, err := s.store.Search(ctx, ts)

@@ -95,12 +95,13 @@ func TestParseCursor_EpochIsValid(t *testing.T) {
 	require.Equal(t, service.NewCursor(time.UnixMilli(0), "urn:uuid:a-1"), c)
 }
 
-// nonCanonicalTrailingBits flips the lowest padding bit of the token's last character:
-// a lenient decoder yields the same bytes from it, but no encoder produces it.
+// nonCanonicalTrailingBits flips the lowest padding bit of the token's last character
+// (XOR keeps the index inside the alphabet whatever the character): a lenient decoder
+// yields the same bytes from it, but no encoder produces it.
 func nonCanonicalTrailingBits(token string) string {
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 	last := strings.IndexByte(alphabet, token[len(token)-1])
-	return token[:len(token)-1] + string(alphabet[last+1])
+	return token[:len(token)-1] + string(alphabet[last^1])
 }
 
 // LogValue renders the two fields a continued page's log lines need.

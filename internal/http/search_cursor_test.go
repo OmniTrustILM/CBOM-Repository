@@ -49,6 +49,14 @@ func TestSearch_CursorValidation(t *testing.T) {
 		{name: "cursor present but empty", query: "cursor=&limit=5", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'cursor' is malformed"},
 		{name: "cursor of a foreign version", query: "cursor=" + urlSafeBase64("v9|1|urn:uuid:a-1") + "&limit=5", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'cursor' is malformed"},
 		{name: "limit is validated before the cursor is decoded", query: "cursor=%21%21%21&limit=0", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' must be an integer between 1 and 1000"},
+		// url.Values drops a pair whose percent-encoding is invalid, so without care a
+		// broken `cursor` would fall through to the `after` branch and be reported as a
+		// missing `after`. The failing parameter must be the one named.
+		{name: "cursor with invalid percent-encoding is reported as cursor", query: "cursor=%zz&limit=5", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'cursor' could not be decoded: invalid URL escape \"%zz\""},
+		{name: "invalid percent-encoding elsewhere is reported by name too", query: "after=1&limit=%zz", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'limit' could not be decoded"},
+		{name: "an undecodable key is reported as written", query: "%zz=1&after=1", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter '%zz' could not be decoded"},
+		{name: "the semicolon separator url.ParseQuery rejects is reported on its pair", query: "after=1;limit=5", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'after' could not be decoded: invalid semicolon separator in query"},
+		{name: "a repeated cursor is rejected rather than the first one winning", query: "cursor=" + valid + "&cursor=" + urlSafeBase64("v1|1|broken") + "&limit=5", expectedStatus: http.StatusBadRequest, expectedDetail: "query parameter 'cursor' must be given once"},
 	}
 
 	// One server for the whole matrix: a rejected request never reaches the store, so

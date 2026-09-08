@@ -157,7 +157,11 @@ func (s Server) URNVersions(w http.ResponseWriter, r *http.Request) {
 func (h Server) Search(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	req, ok := parseSearchRequest(ctx, w, r.URL.Query())
+	query, ok := parseQuery(w, r.URL.RawQuery)
+	if !ok {
+		return
+	}
+	req, ok := parseSearchRequest(ctx, w, query)
 	if !ok {
 		return
 	}
@@ -180,6 +184,42 @@ func (h Server) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.InfoContext(ctx, "Finished.", slog.Int("response-count", len(page.Entries)), slog.Bool("has-next", page.Next != nil))
+}
+
+// parseQuery decodes the query string of GET /v1/bom. r.URL.Query() would drop a
+// parameter whose percent-encoding is invalid and carry on — `cursor=%zz&limit=5` would
+// then be reported as a missing `after` — so the parameter that failed to decode is
+// named in a 400 instead.
+func parseQuery(w http.ResponseWriter, rawQuery string) (url.Values, bool) {
+	query, err := url.ParseQuery(rawQuery)
+	if err == nil {
+		return query, true
+	}
+	if name := undecodableParameter(rawQuery); name != "" {
+		badrequest(w, fmt.Sprintf("Request validation failed, query parameter '%s' could not be decoded: %s.", name, err))
+	} else {
+		badrequest(w, fmt.Sprintf("Request validation failed, the query string could not be decoded: %s.", err))
+	}
+	return nil, false
+}
+
+// undecodableParameter names the first query parameter url.ParseQuery refuses: the raw
+// key of the first `key=value` pair whose key or value is not valid percent-encoding, or
+// that carries the `;` separator ParseQuery rejects. Empty when every pair decodes.
+func undecodableParameter(rawQuery string) string {
+	for _, pair := range strings.Split(rawQuery, "&") {
+		key, value, _ := strings.Cut(pair, "=")
+		if strings.Contains(pair, ";") {
+			return key
+		}
+		if _, err := url.QueryUnescape(key); err != nil {
+			return key
+		}
+		if _, err := url.QueryUnescape(value); err != nil {
+			return key
+		}
+	}
+	return ""
 }
 
 // parseSearchRequest reads the query of GET /v1/bom into the mode it selects. A request
@@ -212,14 +252,20 @@ func parseSearchRequest(ctx context.Context, w http.ResponseWriter, query url.Va
 }
 
 // parseCursorRequest reads a request that continues a run. `cursor` excludes `after` — a
-// run opens with `after` and continues with the cursor, never both — and requires a
-// valid `limit`; the token itself must be in the canonical form this service issues
-// (service.ParseCursor).
+// run opens with `after` and continues with the cursor, never both — is given once, and
+// requires a valid `limit`; the token itself must be in the canonical form this service
+// issues (service.ParseCursor).
 // Checks run cheapest first, so a request that is wrong in several ways is told about
 // its shape before its token.
 func parseCursorRequest(ctx context.Context, w http.ResponseWriter, query url.Values) (req service.SearchRequest, ok bool) {
 	if query.Has("after") {
 		badrequest(w, "Request validation failed, query parameter 'cursor' cannot be combined with 'after': a run opens with 'after' and continues with the cursor from the Link header.")
+		return service.SearchRequest{}, false
+	}
+	if len(query["cursor"]) > 1 {
+		// url.Values would silently take the first; two positions in one request is a
+		// client bug worth reporting, not guessing about.
+		badrequest(w, "Request validation failed, query parameter 'cursor' must be given once.")
 		return service.SearchRequest{}, false
 	}
 	if !query.Has("limit") {

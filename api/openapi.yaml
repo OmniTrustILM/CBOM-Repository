@@ -194,9 +194,11 @@ paths:
         given without `limit`; when `cursor` and `after` are combined (a run opens with
         `after` and continues with `cursor`); when `cursor` is malformed — not
         base64url, wrong version tag, missing fields, non-numeric or negative timestamp,
-        empty key, empty value, or otherwise not canonical; when `limit`
-        is outside 1..1000 (rejected, not clamped); or when, without `cursor`, `after`
-        is missing or not a non-negative integer.
+        empty key, empty value, or otherwise not canonical; when `cursor` is given more
+        than once; when any query parameter cannot be decoded — invalid percent-encoding,
+        or a `;` where `&` is expected (the parameter is named in the problem detail);
+        when `limit` is outside 1..1000 (rejected, not clamped); or when, without
+        `cursor`, `after` is missing or not a non-negative integer.
       operationId: getBOMs
       parameters:
         - name: after
@@ -263,9 +265,10 @@ paths:
           description: >-
             Bad Request: `after` missing (when `cursor` is absent) or not a non-negative
             integer; `limit` outside 1..1000; `cursor` without `limit`; `cursor` combined
-            with `after`; or a malformed `cursor` (not base64url, wrong version tag,
-            missing fields, non-numeric or negative timestamp, empty key, empty value,
-            or otherwise not in the canonical form the service issues).
+            with `after`; `cursor` given more than once; a query parameter that cannot be
+            decoded; or a malformed `cursor` (not base64url, wrong version
+            tag, missing fields, non-numeric or negative timestamp, empty key, empty
+            value, or otherwise not in the canonical form the service issues).
           content:
             application/problem+json:
               schema:
