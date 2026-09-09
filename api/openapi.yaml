@@ -11,7 +11,7 @@ info:
     email: ilm@omnitrust.com
 
   license:
-    name: MIT License
+    name: Apache License, Version 2.0
     url: https://github.com/OmniTrustILM/cbom-repository/blob/main/LICENSE.md
   version: 0.3.0
 
