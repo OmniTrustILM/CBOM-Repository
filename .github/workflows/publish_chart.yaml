@@ -110,7 +110,7 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@main
         with:
-          cosign-release: 'v2.0.0'
+          cosign-release: 'v2.6.5'
 
       - name: Push charts
         if: env.changed == 'true'
